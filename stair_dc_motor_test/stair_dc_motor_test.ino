@@ -21,9 +21,10 @@
 #define ENC_B_PIN     9   // Rear Right encoder, Yellow wire
 
 // ----- Constants -----
-#define COUNTS_PER_REV  4800  // 64 CPR * 150:1 gear ratio
+#define COUNTS_PER_REV  4700  // 64 CPR * 150:1 gear ratio
 #define MOTOR_SPEED     150   // PWM duty cycle (0-255), tune as needed
-#define RAMP_DOWN_THRESHOLD 800  // Start slowing down this many counts before target
+#define RAMP_DOWN_THRESHOLD 2000  // Start slowing down this many counts before target
+#define TIMEOUT_MS      5000  // Safety timeout in milliseconds
 
 // ----- Encoder counters (volatile because modified in ISR) -----
 volatile long encCountA = 0;
@@ -52,20 +53,21 @@ void motorForward(int inaPin, int inbPin, int pwmPin, uint8_t speed) {
 
 void motorBrake(int inaPin, int inbPin, int pwmPin) 
 {
-    // Active brake: both LOW + PWM 0
+    // Active brake: both LOW + PWM 255
     digitalWrite(inaPin, LOW);
     digitalWrite(inbPin, LOW);
-    ledcWrite(pwmPin, 0);
+    ledcWrite(pwmPin, 255);
 }
 
 // ============================================================
 // Rotate exactly one revolution with ramp-down
-// Returns when revolution is complete
+// Returns true if completed, false if timed out
 // ============================================================
 
-void rotateOneRevolution(int inaPin, int inbPin, int pwmPin, volatile long &encCount) 
+bool rotateOneRevolution(int inaPin, int inbPin, int pwmPin, volatile long &encCount) 
 {
     encCount = 0;
+    unsigned long timeout = millis() + TIMEOUT_MS;
     
     // Start at full speed
     motorForward(inaPin, inbPin, pwmPin, MOTOR_SPEED);
@@ -73,6 +75,15 @@ void rotateOneRevolution(int inaPin, int inbPin, int pwmPin, volatile long &encC
     // Wait for revolution, ramp down near the end
     while (encCount < COUNTS_PER_REV) 
     {
+        // Safety timeout
+        if (millis() > timeout) {
+            motorBrake(inaPin, inbPin, pwmPin);
+            Serial.println("TIMEOUT - motor stalled or encoder not reading!");
+            Serial.print("  Counts reached: ");
+            Serial.println(encCount);
+            return false;
+        }
+
         long remaining = COUNTS_PER_REV - encCount;
         
         // Ramp down speed as we approach target to reduce overshoot
@@ -86,6 +97,7 @@ void rotateOneRevolution(int inaPin, int inbPin, int pwmPin, volatile long &encC
     
     // Brake immediately
     motorBrake(inaPin, inbPin, pwmPin);
+    return true;
 }
 
 // ============================================================
@@ -118,7 +130,11 @@ void setup() {
     motorBrake(MOTOR_A_INA, MOTOR_A_INB, MOTOR_A_PWM);
     motorBrake(MOTOR_B_INA, MOTOR_B_INB, MOTOR_B_PWM);
     
-    Serial.println("Setup complete. Starting tests in 3 seconds...");
+    Serial.println("Power on motor supply, then type any key to start...");
+    while (!Serial.available()) {
+    // Wait for user input
+    }
+    Serial.read();
     delay(3000);
     
     // =========================================================
@@ -128,17 +144,19 @@ void setup() {
     
     encCountA = 0;
     unsigned long startTime = millis();
-    rotateOneRevolution(MOTOR_A_INA, MOTOR_A_INB, MOTOR_A_PWM, encCountA);
+    bool success = rotateOneRevolution(MOTOR_A_INA, MOTOR_A_INB, MOTOR_A_PWM, encCountA);
     unsigned long elapsed = millis() - startTime;
     
-    Serial.print("Rear Left done. Counts: ");
-    Serial.print(encCountA);
-    Serial.print(" | Time: ");
-    Serial.print(elapsed);
-    Serial.println(" ms");
-    Serial.print("Overshoot: ");
-    Serial.print(encCountA - COUNTS_PER_REV);
-    Serial.println(" counts");
+    if (success) {
+        Serial.print("Rear Left done. Counts: ");
+        Serial.print(encCountA);
+        Serial.print(" | Time: ");
+        Serial.print(elapsed);
+        Serial.println(" ms");
+        Serial.print("Overshoot: ");
+        Serial.print(encCountA - COUNTS_PER_REV);
+        Serial.println(" counts");
+    }
     
     delay(2000);
     
@@ -149,17 +167,19 @@ void setup() {
     
     encCountB = 0;
     startTime = millis();
-    rotateOneRevolution(MOTOR_B_INA, MOTOR_B_INB, MOTOR_B_PWM, encCountB);
+    success = rotateOneRevolution(MOTOR_B_INA, MOTOR_B_INB, MOTOR_B_PWM, encCountB);
     elapsed = millis() - startTime;
     
-    Serial.print("Rear Right done. Counts: ");
-    Serial.print(encCountB);
-    Serial.print(" | Time: ");
-    Serial.print(elapsed);
-    Serial.println(" ms");
-    Serial.print("Overshoot: ");
-    Serial.print(encCountB - COUNTS_PER_REV);
-    Serial.println(" counts");
+    if (success) {
+        Serial.print("Rear Right done. Counts: ");
+        Serial.print(encCountB);
+        Serial.print(" | Time: ");
+        Serial.print(elapsed);
+        Serial.println(" ms");
+        Serial.print("Overshoot: ");
+        Serial.print(encCountB - COUNTS_PER_REV);
+        Serial.println(" counts");
+    }
     
     delay(2000);
     
@@ -180,14 +200,16 @@ void setup() {
             
             encCountA = 0;
             startTime = millis();
-            rotateOneRevolution(MOTOR_A_INA, MOTOR_A_INB, MOTOR_A_PWM, encCountA);
+            success = rotateOneRevolution(MOTOR_A_INA, MOTOR_A_INB, MOTOR_A_PWM, encCountA);
             elapsed = millis() - startTime;
             
-            Serial.print("Done (");
-            Serial.print(encCountA);
-            Serial.print(" counts, ");
-            Serial.print(elapsed);
-            Serial.println(" ms)");
+            if (success) {
+                Serial.print("Done (");
+                Serial.print(encCountA);
+                Serial.print(" counts, ");
+                Serial.print(elapsed);
+                Serial.println(" ms)");
+            }
         } else {
             // Rear Right
             Serial.print("Cycle ");
@@ -196,17 +218,19 @@ void setup() {
             
             encCountB = 0;
             startTime = millis();
-            rotateOneRevolution(MOTOR_B_INA, MOTOR_B_INB, MOTOR_B_PWM, encCountB);
+            success = rotateOneRevolution(MOTOR_B_INA, MOTOR_B_INB, MOTOR_B_PWM, encCountB);
             elapsed = millis() - startTime;
             
-            Serial.print("Done (");
-            Serial.print(encCountB);
-            Serial.print(" counts, ");
-            Serial.print(elapsed);
-            Serial.println(" ms)");
+            if (success) {
+                Serial.print("Done (");
+                Serial.print(encCountB);
+                Serial.print(" counts, ");
+                Serial.print(elapsed);
+                Serial.println(" ms)");
+            }
         }
         
-        delay(500);  // Small pause between legs
+        delay(500);  // Small pause between legs for visual clarity
     }
     
     Serial.println("\n=== All tests complete ===");

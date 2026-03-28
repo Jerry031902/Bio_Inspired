@@ -11,7 +11,8 @@ void setup() {
   Serial.println("Motor test starting...");
 }
 
-void loop() {
+void loop() 
+{
   // Forward half speed
   Serial.println("Forward");
   digitalWrite(INA_PIN, HIGH);
