@@ -18,7 +18,6 @@ void setup() {
 }
 
 void loop() {
-    // Print raw pin state continuously
     Serial.print("Pin state: ");
     Serial.print(digitalRead(HALL_PIN));
     Serial.print(" | Triggers: ");

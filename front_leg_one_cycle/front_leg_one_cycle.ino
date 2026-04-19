@@ -10,17 +10,16 @@ const int RIGHT_SERVO_PIN = 8;
 // ---------------- Servo tuning ----------------
 const int SERVO_STOP_US = 1500;
 
-// Left servo: below 1500 = forward
-const int LEFT_SERVO_FWD_US = 1700;
+// Left servo forward
+const int LEFT_SERVO_FWD_US = 2500;
 
-// Right servo: above 1500 = forward
-const int RIGHT_SERVO_FWD_US = 1300;
+// Right servo forward
+const int RIGHT_SERVO_FWD_US = 500;
 
 // ---------------- Timing ----------------
 const unsigned long HOME_TIMEOUT_MS = 5000;
 const unsigned long REV_TIMEOUT_MS  = 5000;
 const unsigned long SETTLE_MS       = 80;
-const unsigned long BETWEEN_LEGS_MS = 300;
 
 // ---------------- Servo objects ----------------
 Servo leftServo;
@@ -31,8 +30,6 @@ volatile bool leftHallTriggered = false;
 volatile bool rightHallTriggered = false;
 
 // ---------------- ISRs ----------------
-// Common active-low Hall setup:
-// magnet arrives -> output goes LOW
 void IRAM_ATTR leftHallISR() {
   leftHallTriggered = true;
 }
@@ -162,7 +159,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  Serial.println("Front legs alternating test (L -> R -> L -> R)");
+  Serial.println("Front legs one-cycle test (L -> R)");
 
   pinMode(LEFT_HALL_PIN, INPUT_PULLUP);
   pinMode(RIGHT_HALL_PIN, INPUT_PULLUP);
@@ -184,35 +181,38 @@ void setup() {
   Serial.println("Starting in 2 seconds...");
   delay(2000);
 
-  unsigned long revTime = 0;
+  unsigned long leftTime = 0;
+  unsigned long rightTime = 0;
   bool success = false;
 
-  for (int cycle = 1; cycle <= 4; cycle++) {
-    Serial.println();
-    Serial.print("Cycle ");
-    Serial.println(cycle);
+  Serial.println();
+  Serial.println("Cycle 1");
 
-    if (cycle % 2 == 1) {
-      success = rotateOneRevolutionLeft(revTime);
-    } else {
-      success = rotateOneRevolutionRight(revTime);
-    }
+  success = rotateOneRevolutionLeft(leftTime);
+  if (!success) {
+    Serial.println("Stopping test due to left servo failure/timeout.");
+    servoStop(leftServo);
+    servoStop(rightServo);
+    return;
+  }
 
-    if (!success) {
-      Serial.println("Stopping test due to failure/timeout.");
-      servoStop(leftServo);
-      servoStop(rightServo);
-      return;
-    }
-
-    delay(BETWEEN_LEGS_MS);
+  success = rotateOneRevolutionRight(rightTime);
+  if (!success) {
+    Serial.println("Stopping test due to right servo failure/timeout.");
+    servoStop(leftServo);
+    servoStop(rightServo);
+    return;
   }
 
   servoStop(leftServo);
   servoStop(rightServo);
 
   Serial.println();
-  Serial.println("=== 4-cycle alternating test complete ===");
+  Serial.println("=== One-cycle alternating test complete ===");
+  Serial.print("Left time  = ");
+  Serial.println(leftTime);
+  Serial.print("Right time = ");
+  Serial.println(rightTime);
 }
 
 void loop() {
