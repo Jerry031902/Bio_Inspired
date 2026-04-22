@@ -1,29 +1,24 @@
 #include <WiFi.h>
 #include <WebServer.h>
-#include <ESP32Servo.h>
 
 // ============================================================
-// STAIR Robot — Diagonal Pair Walking Test (A A B B)
-// MERGED WITH SHELL-OPEN / SHELL-CLOSE SERVO
+// STAIR Robot — ESP32 2-motor active-brake test
+// Selected diagonal pair: RR + FL
 //
-// Web UI:
 // - ESP32 creates Wi-Fi hotspot
 // - webpage has START and STOP
-// - START waits 2s, opens shell with servo, then begins walking
-// - STOP is graceful and only stops at an even cycle boundary
-// - after stopping, servo reverses back to original position
+// - START begins motion immediately
+// - STOP is graceful and only stops at an EVEN cycle boundary
 //
-// Pattern:
-//   Cycle 1: RL + FR
-//   Cycle 2: RL + FR
-//   Cycle 3: RR + FL
-//   Cycle 4: RR + FL
-//   Then repeat...
+// Purpose:
+// - test RR + FL only
+// - test ACTIVE BRAKE behavior on ESP32
 // ============================================================
 
 // ---------------- Web UI ----------------
 const char* AP_SSID = "STAIR-Robot";
 const char* AP_PASS = "12345678";
+
 WebServer server(80);
 
 bool runEnabled      = false;
@@ -33,75 +28,43 @@ bool cycleInProgress = false;
 unsigned long completedCycles    = 0;
 unsigned long currentCycleNumber = 0;
 
-// ---------------- Shell servo ----------------
-Servo shellServo;
+// ---------------- Pin map (ESP32 original layout) ----------------
+// Rear-right motor
+#define RR_INA       4
+#define RR_INB       5
+#define RR_PWM       6
+#define ENC_RR_PIN   7
 
-const int SERVO_PIN      = 8;
-const int SERVO_STOP_US  = 1500;
-const int SERVO_OPEN_US  = 600;
-const int SERVO_CLOSE_US = 2400;
-
-const unsigned long SHELL_PRESTART_DELAY_MS = 2000;
-const unsigned long SHELL_OPEN_TIME_MS      = 1400;
-const unsigned long SHELL_CLOSE_TIME_MS     = 1215;
-
-bool shellIsOpen = false;
-
-// ---------------- Rear motor pins ---------------
-#define MOTOR_A_INA   2
-#define MOTOR_A_INB   1
-#define MOTOR_A_PWM   3
-
-#define MOTOR_B_INA   4
-#define MOTOR_B_INB   5
-#define MOTOR_B_PWM   6
-
-// ---------------- Rear encoder pins ----------------
-#define ENC_A_PIN     9   // rear left
-#define ENC_B_PIN     7   // rear right
-
-// ---------------- Front motor pins ----------------
-#define FL_IN1        42
-#define FL_IN2        41
-
-#define FR_IN3        40
-#define FR_IN4        39
-
-// ---------------- Front encoder pins ----------------
-#define ENC_FL_PIN    12
-#define ENC_FR_PIN    13
+// Front-left motor
+#define FL_IN1       42
+#define FL_IN2       41
+#define ENC_FL_PIN   12
 
 // ---------------- Counts ----------------
-const long REAR_LEFT_COUNTS_PER_CYCLE   = 685;
-const long REAR_RIGHT_COUNTS_PER_CYCLE  = 685;
-const long FRONT_LEFT_COUNTS_PER_CYCLE  = 515;
-const long FRONT_RIGHT_COUNTS_PER_CYCLE = 553;
+const long REAR_RIGHT_COUNTS_PER_CYCLE = 700;
+const long FRONT_LEFT_COUNTS_PER_CYCLE = 537;
 
 // ---------------- Speed tuning ----------------
-#define REAR_SPEED_MAX             200
-#define REAR_SPEED_MIN             200
+#define REAR_SPEED_MAX             255
+#define REAR_SPEED_MIN             60
 #define REAR_RAMP_DOWN_THRESHOLD   220
 
-#define FRONT_SPEED_MAX            66
-#define FRONT_SPEED_MIN            66
+#define FRONT_SPEED_MAX            255
+#define FRONT_SPEED_MIN            60
 #define FRONT_RAMP_DOWN_THRESHOLD  160
 
 #define TIMEOUT_MS                 8000
 
-volatile long encCountA  = 0;   // rear left
-volatile long encCountB  = 0;   // rear right
-volatile long encCountFL = 0;   // front left
-volatile long encCountFR = 0;   // front right
+volatile long encCountRR = 0;
+volatile long encCountFL = 0;
 
 // ============================================================
 // Forward declarations
 // ============================================================
 void holdAllStopped();
-bool walkOneDiagonalCycle(bool pairA, unsigned long &elapsedMs);
+bool walkOneCycle(unsigned long &elapsedMs);
 void setupWebServer();
 String buildStatusJson();
-void openShellBeforeWalking();
-void closeShellAfterStopping();
 
 // ============================================================
 // Web page
@@ -119,11 +82,9 @@ const char WEB_PAGE[] PROGMEM = R"rawliteral(
       margin: 30px;
       background: #f4f4f4;
     }
-    h1 {
-      margin-bottom: 20px;
-    }
+    h1 { margin-bottom: 20px; }
     .card {
-      max-width: 440px;
+      max-width: 460px;
       margin: 0 auto;
       background: white;
       border-radius: 14px;
@@ -146,12 +107,8 @@ const char WEB_PAGE[] PROGMEM = R"rawliteral(
       cursor: pointer;
       min-width: 140px;
     }
-    .startBtn {
-      background: #2a9d8f;
-    }
-    .stopBtn {
-      background: #d62828;
-    }
+    .startBtn { background: #2a9d8f; }
+    .stopBtn  { background: #d62828; }
     .status {
       margin-top: 20px;
       font-size: 20px;
@@ -174,15 +131,17 @@ const char WEB_PAGE[] PROGMEM = R"rawliteral(
     </div>
 
     <div class="status">
+      <div><b>Pair:</b> RR + FL</div>
       <div><b>State:</b> <span id="state">Loading...</span></div>
       <div><b>Current cycle:</b> <span id="currentCycle">-</span></div>
       <div><b>Completed cycles:</b> <span id="completedCycles">-</span></div>
       <div><b>Stop requested:</b> <span id="stopRequested">-</span></div>
+      <div><b>RR counts:</b> <span id="rrCounts">-</span></div>
+      <div><b>FL counts:</b> <span id="flCounts">-</span></div>
     </div>
 
     <div class="small">
-      START waits 2 seconds, opens shell, then begins walking.
-      STOP finishes on the next even cycle, then closes shell.
+      ESP32 active-brake test build: 1 diagonal pair only (RR + FL). STOP happens only at an even cycle boundary.
     </div>
   </div>
 
@@ -205,13 +164,15 @@ const char WEB_PAGE[] PROGMEM = R"rawliteral(
         document.getElementById('currentCycle').textContent = s.currentCycle;
         document.getElementById('completedCycles').textContent = s.completedCycles;
         document.getElementById('stopRequested').textContent = s.stopRequested ? 'YES' : 'NO';
+        document.getElementById('rrCounts').textContent = s.rrCounts;
+        document.getElementById('flCounts').textContent = s.flCounts;
       } catch (e) {
         document.getElementById('state').textContent = 'Disconnected';
       }
     }
 
     updateStatus();
-    setInterval(updateStatus, 500);
+    setInterval(updateStatus, 300);
   </script>
 </body>
 </html>
@@ -220,20 +181,12 @@ const char WEB_PAGE[] PROGMEM = R"rawliteral(
 // ============================================================
 // ISRs
 // ============================================================
-void IRAM_ATTR encoderA_ISR() {
-  encCountA++;
-}
-
-void IRAM_ATTR encoderB_ISR() {
-  encCountB++;
+void IRAM_ATTR encoderRR_ISR() {
+  encCountRR++;
 }
 
 void IRAM_ATTR encoderFL_ISR() {
   encCountFL++;
-}
-
-void IRAM_ATTR encoderFR_ISR() {
-  encCountFR++;
 }
 
 // ============================================================
@@ -245,90 +198,34 @@ uint8_t rampSpeedFromRemaining(long remaining, long threshold, uint8_t minSpeed,
   return (uint8_t)map(remaining, 0, threshold, minSpeed, maxSpeed);
 }
 
-void openShellBeforeWalking() {
-  if (shellIsOpen) {
-    Serial.println("Shell already open.");
-    return;
-  }
-
-  Serial.println("Waiting 2000 ms before opening shell...");
-  delay(SHELL_PRESTART_DELAY_MS);
-
-  Serial.println("Opening shell...");
-  shellServo.writeMicroseconds(SERVO_OPEN_US);
-  delay(SHELL_OPEN_TIME_MS);
-
-  shellServo.writeMicroseconds(SERVO_STOP_US);
-  shellIsOpen = true;
-
-  Serial.println("Shell open complete.");
-}
-
-void closeShellAfterStopping() {
-  if (!shellIsOpen) {
-    Serial.println("Shell already closed.");
-    return;
-  }
-
-  Serial.println("Closing shell...");
-  shellServo.writeMicroseconds(SERVO_CLOSE_US);
-  delay(SHELL_CLOSE_TIME_MS);
-
-  shellServo.writeMicroseconds(SERVO_STOP_US);
-  shellIsOpen = false;
-
-  Serial.println("Shell close complete.");
-}
-
 // ============================================================
-// Rear motor control
+// Rear-right motor control (VNH5019 style)
 // ============================================================
-void rearLeftForward(uint8_t speed) {
-  digitalWrite(MOTOR_A_INA, HIGH);
-  digitalWrite(MOTOR_A_INB, LOW);
-  ledcWrite(MOTOR_A_PWM, speed);
-}
-
 void rearRightForward(uint8_t speed) {
-  digitalWrite(MOTOR_B_INA, HIGH);
-  digitalWrite(MOTOR_B_INB, LOW);
-  ledcWrite(MOTOR_B_PWM, speed);
-}
-
-// Rear active brake hold
-void rearLeftStop() {
-  digitalWrite(MOTOR_A_INA, HIGH);
-  digitalWrite(MOTOR_A_INB, HIGH);
-  ledcWrite(MOTOR_A_PWM, 255);
+  digitalWrite(RR_INA, HIGH);
+  digitalWrite(RR_INB, LOW);
+  ledcWrite(RR_PWM, speed);
 }
 
 void rearRightStop() {
-  digitalWrite(MOTOR_B_INA, HIGH);
-  digitalWrite(MOTOR_B_INB, HIGH);
-  ledcWrite(MOTOR_B_PWM, 255);
+  // ACTIVE BRAKE
+  digitalWrite(RR_INA, HIGH);
+  digitalWrite(RR_INB, HIGH);
+  ledcWrite(RR_PWM, 255);
 }
 
 // ============================================================
-// Front motor control
+// Front-left motor control (front-style 2-pin control)
 // ============================================================
 void frontLeftForward(uint8_t speed) {
   ledcWrite(FL_IN1, speed);
   digitalWrite(FL_IN2, LOW);
 }
 
-void frontRightForward(uint8_t speed) {
-  ledcWrite(FR_IN3, speed);
-  digitalWrite(FR_IN4, LOW);
-}
-
 void frontLeftBrake() {
+  // ACTIVE BRAKE
   ledcWrite(FL_IN1, 255);
   digitalWrite(FL_IN2, HIGH);
-}
-
-void frontRightBrake() {
-  ledcWrite(FR_IN3, 255);
-  digitalWrite(FR_IN4, HIGH);
 }
 
 void frontLeftRelease() {
@@ -336,32 +233,12 @@ void frontLeftRelease() {
   digitalWrite(FL_IN2, LOW);
 }
 
-void frontRightRelease() {
-  ledcWrite(FR_IN3, 0);
-  digitalWrite(FR_IN4, LOW);
-}
-
 // ============================================================
 // Global helpers
 // ============================================================
-void stopRearMotors() {
-  rearLeftStop();
-  rearRightStop();
-}
-
-void brakeFrontMotors() {
-  frontLeftBrake();
-  frontRightBrake();
-}
-
-void releaseFrontMotors() {
-  frontLeftRelease();
-  frontRightRelease();
-}
-
 void holdAllStopped() {
-  stopRearMotors();
-  brakeFrontMotors();
+  rearRightStop();
+  frontLeftBrake();
 }
 
 // ============================================================
@@ -386,7 +263,9 @@ String buildStatusJson() {
   json += "\"state\":\"" + state + "\",";
   json += "\"currentCycle\":" + String(shownCycle) + ",";
   json += "\"completedCycles\":" + String(completedCycles) + ",";
-  json += "\"stopRequested\":" + String(stopRequested ? "true" : "false");
+  json += "\"stopRequested\":" + String(stopRequested ? "true" : "false") + ",";
+  json += "\"rrCounts\":" + String(encCountRR) + ",";
+  json += "\"flCounts\":" + String(encCountFL);
   json += "}";
 
   return json;
@@ -417,14 +296,12 @@ void setupWebServer() {
       completedCycles = 0;
       currentCycleNumber = 0;
       stopRequested = false;
-
-      holdAllStopped();
-
-      Serial.println("Web START requested");
-      openShellBeforeWalking();
-
+      encCountRR = 0;
+      encCountFL = 0;
       runEnabled = true;
-      Serial.println("Robot starting walking sequence from cycle 1");
+      holdAllStopped();
+      Serial.println("Web START requested");
+      Serial.println("Robot starting immediately from cycle 1");
     }
     server.send(200, "text/plain", "STARTED");
   });
@@ -432,7 +309,7 @@ void setupWebServer() {
   server.on("/stop", HTTP_POST, []() {
     stopRequested = true;
     Serial.println("Web STOP requested");
-    Serial.println("Robot will stop at the next even cycle boundary, then close shell");
+    Serial.println("Robot will stop at the next even cycle boundary");
     server.send(200, "text/plain", "STOP_REQUESTED");
   });
 
@@ -441,40 +318,21 @@ void setupWebServer() {
 }
 
 // ============================================================
-// One diagonal-pair cycle
-//
-// pairA = true  -> RL + FR
-// pairA = false -> RR + FL
+// One cycle: RR + FL together
 // ============================================================
-bool walkOneDiagonalCycle(bool pairA, unsigned long &elapsedMs) {
-  encCountA  = 0;
-  encCountB  = 0;
+bool walkOneCycle(unsigned long &elapsedMs) {
+  encCountRR = 0;
   encCountFL = 0;
-  encCountFR = 0;
 
-  bool rlActive = pairA;
-  bool frActive = pairA;
-  bool rrActive = !pairA;
-  bool flActive = !pairA;
-
-  bool rlDone = !rlActive;
-  bool rrDone = !rrActive;
-  bool flDone = !flActive;
-  bool frDone = !frActive;
+  bool rrDone = false;
+  bool flDone = false;
 
   unsigned long startTime = millis();
 
-  if (!rlActive) rearLeftStop();
-  if (!rrActive) rearRightStop();
-  if (!flActive) frontLeftBrake();
-  if (!frActive) frontRightBrake();
+  rearRightForward(REAR_SPEED_MAX);
+  frontLeftForward(FRONT_SPEED_MAX);
 
-  if (rlActive) rearLeftForward(REAR_SPEED_MAX);
-  if (rrActive) rearRightForward(REAR_SPEED_MAX);
-  if (flActive) frontLeftForward(FRONT_SPEED_MAX);
-  if (frActive) frontRightForward(FRONT_SPEED_MAX);
-
-  while (!(rlDone && rrDone && flDone && frDone)) {
+  while (!(rrDone && flDone)) {
     server.handleClient();
     yield();
 
@@ -482,41 +340,17 @@ bool walkOneDiagonalCycle(bool pairA, unsigned long &elapsedMs) {
       holdAllStopped();
 
       Serial.println("TIMEOUT - one or more motors did not finish cycle");
-      Serial.print("RL counts = "); Serial.println(encCountA);
-      Serial.print("RR counts = "); Serial.println(encCountB);
+      Serial.print("RR counts = "); Serial.println(encCountRR);
       Serial.print("FL counts = "); Serial.println(encCountFL);
-      Serial.print("FR counts = "); Serial.println(encCountFR);
       return false;
     }
 
-    if (!rlActive) rearLeftStop();
-    if (!rrActive) rearRightStop();
-    if (!flActive) frontLeftBrake();
-    if (!frActive) frontRightBrake();
-
-    if (rlDone) rearLeftStop();
     if (rrDone) rearRightStop();
     if (flDone) frontLeftBrake();
-    if (frDone) frontRightBrake();
 
-    if (!rlDone) {
-      long remaining = REAR_LEFT_COUNTS_PER_CYCLE - encCountA;
-      if (remaining <= 0) {
-        rearLeftStop();
-        rlDone = true;
-      } else {
-        uint8_t s = rampSpeedFromRemaining(
-          remaining,
-          REAR_RAMP_DOWN_THRESHOLD,
-          REAR_SPEED_MIN,
-          REAR_SPEED_MAX
-        );
-        ledcWrite(MOTOR_A_PWM, s);
-      }
-    }
-
+    // Rear Right
     if (!rrDone) {
-      long remaining = REAR_RIGHT_COUNTS_PER_CYCLE - encCountB;
+      long remaining = REAR_RIGHT_COUNTS_PER_CYCLE - encCountRR;
       if (remaining <= 0) {
         rearRightStop();
         rrDone = true;
@@ -527,10 +361,11 @@ bool walkOneDiagonalCycle(bool pairA, unsigned long &elapsedMs) {
           REAR_SPEED_MIN,
           REAR_SPEED_MAX
         );
-        ledcWrite(MOTOR_B_PWM, s);
+        ledcWrite(RR_PWM, s);
       }
     }
 
+    // Front Left
     if (!flDone) {
       long remaining = FRONT_LEFT_COUNTS_PER_CYCLE - encCountFL;
       if (remaining <= 0) {
@@ -546,22 +381,6 @@ bool walkOneDiagonalCycle(bool pairA, unsigned long &elapsedMs) {
         ledcWrite(FL_IN1, s);
       }
     }
-
-    if (!frDone) {
-      long remaining = FRONT_RIGHT_COUNTS_PER_CYCLE - encCountFR;
-      if (remaining <= 0) {
-        frontRightBrake();
-        frDone = true;
-      } else {
-        uint8_t s = rampSpeedFromRemaining(
-          remaining,
-          FRONT_RAMP_DOWN_THRESHOLD,
-          FRONT_SPEED_MIN,
-          FRONT_SPEED_MAX
-        );
-        ledcWrite(FR_IN3, s);
-      }
-    }
   }
 
   elapsedMs = millis() - startTime;
@@ -572,63 +391,42 @@ bool walkOneDiagonalCycle(bool pairA, unsigned long &elapsedMs) {
 // Setup
 // ============================================================
 void setup() {
+  // --- Motor control pins first ---
+  pinMode(RR_INA, OUTPUT);
+  pinMode(RR_INB, OUTPUT);
+  pinMode(FL_IN2, OUTPUT);
+
+  // --- PWM attach first ---
+  ledcAttach(RR_PWM, 20000, 8);
+  ledcAttach(FL_IN1, 20000, 8);
+
+  // --- Encoder pins ---
+  pinMode(ENC_RR_PIN, INPUT);
+  pinMode(ENC_FL_PIN, INPUT);
+
+  // --- Force active brake ASAP ---
+  holdAllStopped();
+
+  // --- Serial after outputs are already defined ---
   Serial.begin(115200);
-  delay(1000);
+  delay(100);
 
-  Serial.println("STAIR - diagonal pair walking (A A B B) + shell servo");
-  Serial.println("Cycle 1: RL + FR");
-  Serial.println("Cycle 2: RL + FR");
-  Serial.println("Cycle 3: RR + FL");
-  Serial.println("Cycle 4: RR + FL");
-  Serial.println("START waits 2 seconds, opens shell, then walks.");
-  Serial.println("STOP finishes on an even cycle, then closes shell.");
+  Serial.println();
+  Serial.println("STAIR - ESP32 2-motor diagonal ACTIVE-BRAKE test");
+  Serial.println("Pair: RR + FL");
+  Serial.println("Repeated cycle: RR + FL, RR + FL, RR + FL...");
+  Serial.println("STOP is graceful at EVEN cycle boundary");
 
-  Serial.print("Rear left counts/cycle   = ");
-  Serial.println(REAR_LEFT_COUNTS_PER_CYCLE);
-
-  Serial.print("Rear right counts/cycle  = ");
+  Serial.print("Rear right counts/cycle = ");
   Serial.println(REAR_RIGHT_COUNTS_PER_CYCLE);
 
-  Serial.print("Front left counts/cycle  = ");
+  Serial.print("Front left counts/cycle = ");
   Serial.println(FRONT_LEFT_COUNTS_PER_CYCLE);
 
-  Serial.print("Front right counts/cycle = ");
-  Serial.println(FRONT_RIGHT_COUNTS_PER_CYCLE);
-
-  pinMode(MOTOR_A_INA, OUTPUT);
-  pinMode(MOTOR_A_INB, OUTPUT);
-  pinMode(MOTOR_B_INA, OUTPUT);
-  pinMode(MOTOR_B_INB, OUTPUT);
-
-  pinMode(FL_IN1, OUTPUT);
-  pinMode(FL_IN2, OUTPUT);
-  pinMode(FR_IN3, OUTPUT);
-  pinMode(FR_IN4, OUTPUT);
-
-  ledcAttach(MOTOR_A_PWM, 20000, 8);
-  ledcAttach(MOTOR_B_PWM, 20000, 8);
-  ledcAttach(FL_IN1, 20000, 8);
-  ledcAttach(FR_IN3, 20000, 8);
-
-  pinMode(ENC_A_PIN, INPUT);
-  pinMode(ENC_B_PIN, INPUT);
-  pinMode(ENC_FL_PIN, INPUT);
-  pinMode(ENC_FR_PIN, INPUT);
-
-  attachInterrupt(digitalPinToInterrupt(ENC_A_PIN),  encoderA_ISR,  CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENC_B_PIN),  encoderB_ISR,  CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_RR_PIN), encoderRR_ISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_FL_PIN), encoderFL_ISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENC_FR_PIN), encoderFR_ISR, CHANGE);
 
-  shellServo.setPeriodHertz(50);
-  shellServo.attach(SERVO_PIN, 500, 2500);
-  shellServo.writeMicroseconds(SERVO_STOP_US);
-
-  holdAllStopped();
   setupWebServer();
-
-  Serial.print("Servo attached: ");
-  Serial.println(shellServo.attached());
 
   Serial.println("Ready. Waiting for START button...");
 }
@@ -645,10 +443,10 @@ void loop() {
     return;
   }
 
+  // If STOP was requested while already at an even boundary, stop now.
   if (stopRequested && !cycleInProgress && (completedCycles % 2 == 0)) {
     runEnabled = false;
     holdAllStopped();
-    closeShellAfterStopping();
     Serial.println("Stop request satisfied at even cycle boundary");
     delay(5);
     return;
@@ -657,23 +455,20 @@ void loop() {
   currentCycleNumber = completedCycles + 1;
   cycleInProgress = true;
 
-  bool pairA = (((currentCycleNumber - 1) / 2) % 2 == 0);
-
-  unsigned long tCycle = 0;
-
   Serial.println();
   Serial.print("=== WALK CYCLE ");
   Serial.print(currentCycleNumber);
-  Serial.print(" START: ");
-  Serial.println(pairA ? "RL + FR" : "RR + FL");
+  Serial.println(" START: RR + FL");
 
-  bool ok = walkOneDiagonalCycle(pairA, tCycle);
+  unsigned long tCycle = 0;
+  bool ok = walkOneCycle(tCycle);
+
   cycleInProgress = false;
 
   if (!ok) {
     runEnabled = false;
     holdAllStopped();
-    Serial.println("Cycle failed. Holding brake.");
+    Serial.println("Cycle failed. Holding active brake.");
     return;
   }
 
@@ -686,15 +481,13 @@ void loop() {
   Serial.print(tCycle);
   Serial.println(" ms");
 
-  Serial.print("RL counts = "); Serial.println(encCountA);
-  Serial.print("RR counts = "); Serial.println(encCountB);
+  Serial.print("RR counts = "); Serial.println(encCountRR);
   Serial.print("FL counts = "); Serial.println(encCountFL);
-  Serial.print("FR counts = "); Serial.println(encCountFR);
 
+  // Graceful stop only after even-numbered cycle
   if (stopRequested && (completedCycles % 2 == 0)) {
     runEnabled = false;
     holdAllStopped();
-    closeShellAfterStopping();
     Serial.println("Graceful STOP complete at even cycle boundary");
   }
 }

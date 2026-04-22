@@ -1,174 +1,191 @@
-#include <ESP32Servo.h>
+#include <Arduino.h>
 
 // ============================================================
-// SPEED CALIBRATION TEST
-// Compare:
-//   - 1 rear Pololu DC leg (encoder-based 1 rev)
-//   - 1 front continuous servo leg (Hall-based 1 rev)
-// Goal:
-//   Match average time per revolution
+// STAIR auto one-cycle timing test
+// Auto-runs once after reset:
+//
+// 1) Rear Right one cycle
+// 2) wait 1 second
+// 3) Front Right one cycle
+// 4) print summary
 // ============================================================
 
-// ---------------- Rear Left Pololu motor ----------------
-#define MOTOR_INA   1
-#define MOTOR_INB   2
-#define MOTOR_PWM   3
-#define ENC_PIN     7    // one encoder channel through divider
+// ---------------- Rear right motor pins ----------------
+#define MOTOR_B_INA   4
+#define MOTOR_B_INB   5
+#define MOTOR_B_PWM   6
 
-// ---------------- Front Left servo ----------------
-#define HALL_PIN    13
-#define SERVO_PIN   11
+// ---------------- Rear right encoder pin ----------------
+#define ENC_B_PIN     7
 
-// ---------------- Calibration values to tune ----------------
-#define DC_PWM_VALUE        150    // tune this
-#define SERVO_FWD_US        1300   // tune this
-#define SERVO_STOP_US       1500
+// ---------------- Front right motor pins ----------------
+// Kept same as your recent walking code:
+//   PWM on GPIO40, GPIO39 LOW
+#define FR_IN3        40
+#define FR_IN4        39
 
-// ---------------- Test settings ----------------
-#define COUNTS_PER_REV      4800   // one encoder channel, CHANGE
-#define DC_TIMEOUT_MS       5000
-#define SERVO_TIMEOUT_MS    5000
-#define HOME_TIMEOUT_MS     5000
-#define SETTLE_MS           100
-#define BETWEEN_TESTS_MS    1000
-#define NUM_TRIALS          3
+// ---------------- Front right encoder pin ----------------
+#define ENC_FR_PIN    13
 
-// ---------------- Globals ----------------
-volatile long encCount = 0;
-volatile bool hallTriggered = false;
+// ---------------- Counts from your walking code ----------------
+const long REAR_RIGHT_COUNTS_PER_CYCLE  = 680;
+const long FRONT_RIGHT_COUNTS_PER_CYCLE = 551;
 
-Servo frontServo;
+// ---------------- Test PWM ----------------
+const int REAR_RIGHT_TEST_PWM  = 150;
+const int FRONT_RIGHT_TEST_PWM = 53;
+
+const unsigned long TIMEOUT_MS = 8000;
+
+// ---------------- Encoder counts ----------------
+volatile long encCountB  = 0;
+volatile long encCountFR = 0;
+
+bool testDone = false;
 
 // ============================================================
 // ISR
 // ============================================================
-void IRAM_ATTR encoderISR() {
-  encCount++;
+void IRAM_ATTR encoderB_ISR() {
+  encCountB++;
 }
 
-void IRAM_ATTR hallISR() {
-  hallTriggered = true;
-}
-
-// ============================================================
-// Rear motor helpers
-// ============================================================
-void motorForward(uint8_t speedVal) {
-  digitalWrite(MOTOR_INA, HIGH);
-  digitalWrite(MOTOR_INB, LOW);
-  ledcWrite(MOTOR_PWM, speedVal);
-}
-
-void motorBrake() {
-  // Your active-brake version that worked
-  digitalWrite(MOTOR_INA, LOW);
-  digitalWrite(MOTOR_INB, LOW);
-  ledcWrite(MOTOR_PWM, 255);
+void IRAM_ATTR encoderFR_ISR() {
+  encCountFR++;
 }
 
 // ============================================================
-// Servo helpers
+// Motor control
 // ============================================================
-void servoStop() {
-  frontServo.writeMicroseconds(SERVO_STOP_US);
+void rearRightForward(uint8_t speed) {
+  digitalWrite(MOTOR_B_INA, HIGH);
+  digitalWrite(MOTOR_B_INB, LOW);
+  ledcWrite(MOTOR_B_PWM, speed);
 }
 
-void servoForward() {
-  frontServo.writeMicroseconds(SERVO_FWD_US);
+void rearRightStop() {
+  digitalWrite(MOTOR_B_INA, HIGH);
+  digitalWrite(MOTOR_B_INB, HIGH);
+  ledcWrite(MOTOR_B_PWM, 255);   // active brake
+}
+
+void frontRightForward(uint8_t speed) {
+  ledcWrite(FR_IN3, speed);
+  digitalWrite(FR_IN4, LOW);
+}
+
+void frontRightBrake() {
+  ledcWrite(FR_IN3, 255);
+  digitalWrite(FR_IN4, HIGH);
+}
+
+void holdAllStopped() {
+  rearRightStop();
+  frontRightBrake();
 }
 
 // ============================================================
-// Wait for Hall edge
+// Tests
 // ============================================================
-bool waitForHallEdge(unsigned long timeoutMs) {
-  hallTriggered = false;
-  unsigned long start = millis();
+bool runRearRightOneCycle(unsigned long &elapsedMs) {
+  encCountB = 0;
+  delay(100);
 
-  while (!hallTriggered) {
-    if (millis() - start > timeoutMs) {
+  Serial.println();
+  Serial.println("---- REAR RIGHT TEST START ----");
+  Serial.print("Target counts = ");
+  Serial.println(REAR_RIGHT_COUNTS_PER_CYCLE);
+  Serial.print("PWM = ");
+  Serial.println(REAR_RIGHT_TEST_PWM);
+
+  unsigned long startTime = millis();
+  unsigned long lastPrint = 0;
+
+  rearRightForward(REAR_RIGHT_TEST_PWM);
+
+  while (encCountB < REAR_RIGHT_COUNTS_PER_CYCLE) {
+    if (millis() - startTime > TIMEOUT_MS) {
+      rearRightStop();
+      elapsedMs = millis() - startTime;
+
+      Serial.println("REAR RIGHT TIMEOUT");
+      Serial.print("Counts reached = ");
+      Serial.println(encCountB);
+      Serial.print("Elapsed time = ");
+      Serial.print(elapsedMs);
+      Serial.println(" ms");
       return false;
     }
+
+    if (millis() - lastPrint >= 100) {
+      lastPrint = millis();
+      Serial.print("RR counts = ");
+      Serial.println(encCountB);
+    }
   }
+
+  rearRightStop();
+  elapsedMs = millis() - startTime;
+  delay(300);
+
+  Serial.println("REAR RIGHT COMPLETE");
+  Serial.print("Final counts = ");
+  Serial.println(encCountB);
+  Serial.print("Elapsed time = ");
+  Serial.print(elapsedMs);
+  Serial.println(" ms");
+
   return true;
 }
 
-// ============================================================
-// Rear DC one revolution
-// Returns true if success, false if timeout
-// revTimeMs gets filled with measured time
-// ============================================================
-bool runOneRevDC(unsigned long &revTimeMs) {
-  encCount = 0;
+bool runFrontRightOneCycle(unsigned long &elapsedMs) {
+  encCountFR = 0;
+  delay(100);
+
+  Serial.println();
+  Serial.println("---- FRONT RIGHT TEST START ----");
+  Serial.print("Target counts = ");
+  Serial.println(FRONT_RIGHT_COUNTS_PER_CYCLE);
+  Serial.print("PWM = ");
+  Serial.println(FRONT_RIGHT_TEST_PWM);
 
   unsigned long startTime = millis();
-  unsigned long timeout = startTime + DC_TIMEOUT_MS;
+  unsigned long lastPrint = 0;
 
-  motorForward(DC_PWM_VALUE);
+  frontRightForward(FRONT_RIGHT_TEST_PWM);
 
-  while (encCount < COUNTS_PER_REV) {
-    if (millis() > timeout) {
-      motorBrake();
-      delay(SETTLE_MS);
-      Serial.println("DC TIMEOUT");
-      Serial.print("DC count reached: ");
-      Serial.println(encCount);
+  while (encCountFR < FRONT_RIGHT_COUNTS_PER_CYCLE) {
+    if (millis() - startTime > TIMEOUT_MS) {
+      frontRightBrake();
+      elapsedMs = millis() - startTime;
+
+      Serial.println("FRONT RIGHT TIMEOUT");
+      Serial.print("Counts reached = ");
+      Serial.println(encCountFR);
+      Serial.print("Elapsed time = ");
+      Serial.print(elapsedMs);
+      Serial.println(" ms");
       return false;
     }
-  }
 
-  motorBrake();
-  delay(SETTLE_MS);
-
-  revTimeMs = millis() - startTime;
-
-  Serial.print("DC final count after settle: ");
-  Serial.println(encCount);
-
-  return true;
-}
-
-// ============================================================
-// Front servo one revolution
-// Logic:
-// - start moving forward
-// - if magnet is already detected, wait for it to leave
-// - then wait for next FALLING edge = one full revolution
-// ============================================================
-bool runOneRevServo(unsigned long &revTimeMs) {
-  Serial.print("Initial hall state = ");
-  Serial.println(digitalRead(HALL_PIN));
-
-  servoForward();
-
-  // If magnet starts at sensor, wait until it leaves first
-  if (digitalRead(HALL_PIN) == LOW) {
-    Serial.println("Servo magnet starts at sensor, waiting to leave...");
-
-    unsigned long leaveStart = millis();
-    while (digitalRead(HALL_PIN) == LOW) {
-      if (millis() - leaveStart > HOME_TIMEOUT_MS) {
-        servoStop();
-        Serial.println("SERVO TIMEOUT waiting for magnet to leave");
-        return false;
-      }
+    if (millis() - lastPrint >= 100) {
+      lastPrint = millis();
+      Serial.print("FR counts = ");
+      Serial.println(encCountFR);
     }
-
-    Serial.println("Servo magnet left sensor");
-    delay(20);
   }
 
-  unsigned long startTime = millis();
-  bool gotRev = waitForHallEdge(SERVO_TIMEOUT_MS);
+  frontRightBrake();
+  elapsedMs = millis() - startTime;
+  delay(300);
 
-  servoStop();
-  delay(SETTLE_MS);
+  Serial.println("FRONT RIGHT COMPLETE");
+  Serial.print("Final counts = ");
+  Serial.println(encCountFR);
+  Serial.print("Elapsed time = ");
+  Serial.print(elapsedMs);
+  Serial.println(" ms");
 
-  if (!gotRev) {
-    Serial.println("SERVO TIMEOUT waiting for full revolution");
-    return false;
-  }
-
-  revTimeMs = millis() - startTime;
   return true;
 }
 
@@ -179,151 +196,85 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  Serial.println("========================================");
-  Serial.println("Rear DC + Front Servo Speed Calibration");
-  Serial.println("========================================");
-  Serial.print("DC PWM = ");
-  Serial.println(DC_PWM_VALUE);
-  Serial.print("Servo forward us = ");
-  Serial.println(SERVO_FWD_US);
   Serial.println();
+  Serial.println("===== STAIR AUTO TIMING TEST =====");
+  Serial.println("Will auto-run after 3 seconds...");
+  Serial.println("Test order: rear right -> front right");
+  Serial.println("==================================");
 
-  // ----- Rear motor setup -----
-  pinMode(MOTOR_INA, OUTPUT);
-  pinMode(MOTOR_INB, OUTPUT);
+  pinMode(MOTOR_B_INA, OUTPUT);
+  pinMode(MOTOR_B_INB, OUTPUT);
 
-  ledcAttach(MOTOR_PWM, 20000, 8);
+  pinMode(FR_IN3, OUTPUT);
+  pinMode(FR_IN4, OUTPUT);
 
-  pinMode(ENC_PIN, INPUT);
-  attachInterrupt(digitalPinToInterrupt(ENC_PIN), encoderISR, CHANGE);
+  ledcAttach(MOTOR_B_PWM, 20000, 8);
+  ledcAttach(FR_IN3, 20000, 8);
 
-  motorBrake();
+  pinMode(ENC_B_PIN, INPUT);
+  pinMode(ENC_FR_PIN, INPUT);
 
-  // ----- Front servo setup -----
-  pinMode(HALL_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(HALL_PIN), hallISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(ENC_B_PIN), encoderB_ISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_FR_PIN), encoderFR_ISR, CHANGE);
 
-  frontServo.setPeriodHertz(50);
-  frontServo.attach(SERVO_PIN, 500, 2500);
-  servoStop();
-
-  delay(1000);
-
-  Serial.println("Type any key to start calibration...");
-  while (!Serial.available()) {
-    // wait
-  }
-  Serial.read();
-
-  delay(1000);
-
-  // =========================================================
-  // DC trials
-  // =========================================================
-  unsigned long dcTimes[NUM_TRIALS];
-  unsigned long servoTimes[NUM_TRIALS];
-  int dcSuccessCount = 0;
-  int servoSuccessCount = 0;
-  unsigned long dcSum = 0;
-  unsigned long servoSum = 0;
-
-  Serial.println();
-  Serial.println("----- DC MOTOR TESTS -----");
-
-  for (int i = 0; i < NUM_TRIALS; i++) {
-    Serial.print("DC Trial ");
-    Serial.print(i + 1);
-    Serial.println("...");
-
-    unsigned long t = 0;
-    bool ok = runOneRevDC(t);
-
-    if (ok) {
-      dcTimes[dcSuccessCount] = t;
-      dcSum += t;
-      dcSuccessCount++;
-
-      Serial.print("DC time (ms): ");
-      Serial.println(t);
-    }
-
-    delay(BETWEEN_TESTS_MS);
-    Serial.println();
-  }
-
-  // =========================================================
-  // Servo trials
-  // =========================================================
-  Serial.println("----- SERVO TESTS -----");
-
-  for (int i = 0; i < NUM_TRIALS; i++) {
-    Serial.print("Servo Trial ");
-    Serial.print(i + 1);
-    Serial.println("...");
-
-    unsigned long t = 0;
-    bool ok = runOneRevServo(t);
-
-    if (ok) {
-      servoTimes[servoSuccessCount] = t;
-      servoSum += t;
-      servoSuccessCount++;
-
-      Serial.print("Servo time (ms): ");
-      Serial.println(t);
-    }
-
-    delay(BETWEEN_TESTS_MS);
-    Serial.println();
-  }
-
-  // =========================================================
-  // Summary
-  // =========================================================
-  Serial.println("========================================");
-  Serial.println("SUMMARY");
-  Serial.println("========================================");
-
-  if (dcSuccessCount > 0) {
-    Serial.print("DC average time (ms): ");
-    Serial.println((float)dcSum / dcSuccessCount);
-  } else {
-    Serial.println("DC average time: no valid trials");
-  }
-
-  if (servoSuccessCount > 0) {
-    Serial.print("Servo average time (ms): ");
-    Serial.println((float)servoSum / servoSuccessCount);
-  } else {
-    Serial.println("Servo average time: no valid trials");
-  }
-
-  if (dcSuccessCount > 0 && servoSuccessCount > 0) {
-    float dcAvg = (float)dcSum / dcSuccessCount;
-    float servoAvg = (float)servoSum / servoSuccessCount;
-
-    Serial.print("Difference (servo - dc) ms: ");
-    Serial.println(servoAvg - dcAvg);
-
-    Serial.println();
-    Serial.println("Tuning hint:");
-    if (servoAvg > dcAvg) {
-      Serial.println("- Servo is slower than DC");
-      Serial.println("- Make servo command farther from 1500");
-      Serial.println("  (example: 1300 -> 1250)");
-    } else if (servoAvg < dcAvg) {
-      Serial.println("- Servo is faster than DC");
-      Serial.println("- Move servo command closer to 1500");
-      Serial.println("  (example: 1300 -> 1350)");
-    } else {
-      Serial.println("- Speeds are very close");
-    }
-  }
-
-  Serial.println();
-  Serial.println("Calibration run complete.");
+  holdAllStopped();
 }
 
+// ============================================================
+// Loop
+// ============================================================
 void loop() {
-  // nothing
+  if (testDone) {
+    delay(1000);
+    return;
+  }
+
+  delay(3000);
+
+  unsigned long tRear = 0;
+  unsigned long tFront = 0;
+
+  bool okRear = runRearRightOneCycle(tRear);
+
+  delay(1000);
+
+  bool okFront = runFrontRightOneCycle(tFront);
+
+  Serial.println();
+  Serial.println("========== SUMMARY ==========");
+
+  Serial.print("Rear Right: ");
+  if (okRear) {
+    Serial.print(tRear);
+    Serial.println(" ms");
+  } else {
+    Serial.println("FAILED / TIMEOUT");
+  }
+
+  Serial.print("Front Right: ");
+  if (okFront) {
+    Serial.print(tFront);
+    Serial.println(" ms");
+  } else {
+    Serial.println("FAILED / TIMEOUT");
+  }
+
+  if (okRear && okFront) {
+    long diff = (long)tRear - (long)tFront;
+    Serial.print("Time difference = ");
+    Serial.print(diff);
+    Serial.println(" ms");
+
+    if (diff > 0) {
+      Serial.println("Rear right is slower.");
+    } else if (diff < 0) {
+      Serial.println("Front right is slower.");
+    } else {
+      Serial.println("They are matched.");
+    }
+  }
+
+  Serial.println("=============================");
+  holdAllStopped();
+  testDone = true;
 }

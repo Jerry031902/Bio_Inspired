@@ -3,22 +3,26 @@
 #include <ESP32Servo.h>
 
 // ============================================================
-// STAIR Robot — Diagonal Pair Walking Test (A A B B)
+// STAIR Robot — One-Leg-at-a-Time Walking Test
 // MERGED WITH SHELL-OPEN / SHELL-CLOSE SERVO
 //
 // Web UI:
 // - ESP32 creates Wi-Fi hotspot
 // - webpage has START and STOP
 // - START waits 2s, opens shell with servo, then begins walking
-// - STOP is graceful and only stops at an even cycle boundary
+// - STOP is graceful and only stops at a full 4-leg boundary
 // - after stopping, servo reverses back to original position
 //
 // Pattern:
-//   Cycle 1: RL + FR
-//   Cycle 2: RL + FR
-//   Cycle 3: RR + FL
-//   Cycle 4: RR + FL
+//   Move 1: RL  (double cycle)
+//   Move 2: FL  (double cycle)
+//   Move 3: RR  (double cycle)
+//   Move 4: FR  (double cycle)
 //   Then repeat...
+//
+// Note:
+// Each active leg move uses 2x the original counts-per-cycle so the
+// leg returns closer to the same mechanical phase before the next leg.
 // ============================================================
 
 // ---------------- Web UI ----------------
@@ -30,8 +34,8 @@ bool runEnabled      = false;
 bool stopRequested   = false;
 bool cycleInProgress = false;
 
-unsigned long completedCycles    = 0;
-unsigned long currentCycleNumber = 0;
+unsigned long completedCycles    = 0;   // now means completed LEG MOVES
+unsigned long currentCycleNumber = 0;   // now means current LEG MOVE number
 
 // ---------------- Shell servo ----------------
 Servo shellServo;
@@ -72,21 +76,20 @@ bool shellIsOpen = false;
 #define ENC_FR_PIN    13
 
 // ---------------- Counts ----------------
-const long REAR_LEFT_COUNTS_PER_CYCLE   = 685;
-const long REAR_RIGHT_COUNTS_PER_CYCLE  = 685;
-const long FRONT_LEFT_COUNTS_PER_CYCLE  = 515;
-const long FRONT_RIGHT_COUNTS_PER_CYCLE = 553;
+const long REAR_LEFT_COUNTS_PER_CYCLE   = 700;
+const long REAR_RIGHT_COUNTS_PER_CYCLE  = 700;
+const long FRONT_LEFT_COUNTS_PER_CYCLE  = 605;
+const long FRONT_RIGHT_COUNTS_PER_CYCLE = 600;
+
+const int LEG_MOVE_MULTIPLIER = 2;  // each active leg move = 2x old cycle
+
+// 0 = RL, 1 = FL, 2 = RR, 3 = FR
+const uint8_t LEG_SEQUENCE[4] = {0, 1, 2, 3};
 
 // ---------------- Speed tuning ----------------
-#define REAR_SPEED_MAX             200
-#define REAR_SPEED_MIN             200
-#define REAR_RAMP_DOWN_THRESHOLD   220
-
-#define FRONT_SPEED_MAX            66
-#define FRONT_SPEED_MIN            66
-#define FRONT_RAMP_DOWN_THRESHOLD  160
-
-#define TIMEOUT_MS                 8000
+#define REAR_SPEED             200
+#define FRONT_SPEED            66
+#define TIMEOUT_MS             8000
 
 volatile long encCountA  = 0;   // rear left
 volatile long encCountB  = 0;   // rear right
@@ -97,11 +100,12 @@ volatile long encCountFR = 0;   // front right
 // Forward declarations
 // ============================================================
 void holdAllStopped();
-bool walkOneDiagonalCycle(bool pairA, unsigned long &elapsedMs);
+bool walkOneLegMove(uint8_t legIndex, unsigned long &elapsedMs);
 void setupWebServer();
 String buildStatusJson();
 void openShellBeforeWalking();
 void closeShellAfterStopping();
+const char* legName(uint8_t legIndex);
 
 // ============================================================
 // Web page
@@ -175,14 +179,14 @@ const char WEB_PAGE[] PROGMEM = R"rawliteral(
 
     <div class="status">
       <div><b>State:</b> <span id="state">Loading...</span></div>
-      <div><b>Current cycle:</b> <span id="currentCycle">-</span></div>
-      <div><b>Completed cycles:</b> <span id="completedCycles">-</span></div>
+      <div><b>Current move:</b> <span id="currentCycle">-</span></div>
+      <div><b>Completed moves:</b> <span id="completedCycles">-</span></div>
       <div><b>Stop requested:</b> <span id="stopRequested">-</span></div>
     </div>
 
     <div class="small">
-      START waits 2 seconds, opens shell, then begins walking.
-      STOP finishes on the next even cycle, then closes shell.
+      START waits 2 seconds, opens shell, then begins one-leg-at-a-time walking.
+      STOP finishes on the next full 4-leg boundary, then closes shell.
     </div>
   </div>
 
@@ -239,10 +243,15 @@ void IRAM_ATTR encoderFR_ISR() {
 // ============================================================
 // Helpers
 // ============================================================
-uint8_t rampSpeedFromRemaining(long remaining, long threshold, uint8_t minSpeed, uint8_t maxSpeed) {
-  if (remaining >= threshold) return maxSpeed;
-  if (remaining <= 0) return 0;
-  return (uint8_t)map(remaining, 0, threshold, minSpeed, maxSpeed);
+
+const char* legName(uint8_t legIndex) {
+  switch (legIndex) {
+    case 0: return "RL";
+    case 1: return "FL";
+    case 2: return "RR";
+    case 3: return "FR";
+    default: return "?";
+  }
 }
 
 void openShellBeforeWalking() {
@@ -424,7 +433,7 @@ void setupWebServer() {
       openShellBeforeWalking();
 
       runEnabled = true;
-      Serial.println("Robot starting walking sequence from cycle 1");
+      Serial.println("Robot starting one-leg-at-a-time walking from move 1");
     }
     server.send(200, "text/plain", "STARTED");
   });
@@ -432,7 +441,7 @@ void setupWebServer() {
   server.on("/stop", HTTP_POST, []() {
     stopRequested = true;
     Serial.println("Web STOP requested");
-    Serial.println("Robot will stop at the next even cycle boundary, then close shell");
+    Serial.println("Robot will stop at the next full 4-leg boundary, then close shell");
     server.send(200, "text/plain", "STOP_REQUESTED");
   });
 
@@ -441,47 +450,61 @@ void setupWebServer() {
 }
 
 // ============================================================
-// One diagonal-pair cycle
+// One active-leg move
 //
-// pairA = true  -> RL + FR
-// pairA = false -> RR + FL
+// legIndex:
+//   0 -> RL
+//   1 -> FL
+//   2 -> RR
+//   3 -> FR
 // ============================================================
-bool walkOneDiagonalCycle(bool pairA, unsigned long &elapsedMs) {
+bool walkOneLegMove(uint8_t legIndex, unsigned long &elapsedMs) {
   encCountA  = 0;
   encCountB  = 0;
   encCountFL = 0;
   encCountFR = 0;
 
-  bool rlActive = pairA;
-  bool frActive = pairA;
-  bool rrActive = !pairA;
-  bool flActive = !pairA;
+  bool rlActive = (legIndex == 0);
+  bool flActive = (legIndex == 1);
+  bool rrActive = (legIndex == 2);
+  bool frActive = (legIndex == 3);
 
   bool rlDone = !rlActive;
-  bool rrDone = !rrActive;
   bool flDone = !flActive;
+  bool rrDone = !rrActive;
   bool frDone = !frActive;
+
+  const long rlTarget = REAR_LEFT_COUNTS_PER_CYCLE   * LEG_MOVE_MULTIPLIER;
+  const long rrTarget = REAR_RIGHT_COUNTS_PER_CYCLE  * LEG_MOVE_MULTIPLIER;
+  const long flTarget = FRONT_LEFT_COUNTS_PER_CYCLE  * LEG_MOVE_MULTIPLIER;
+  const long frTarget = FRONT_RIGHT_COUNTS_PER_CYCLE * LEG_MOVE_MULTIPLIER;
+
+  const unsigned long moveTimeout = TIMEOUT_MS * LEG_MOVE_MULTIPLIER;
 
   unsigned long startTime = millis();
 
+  // Hold inactive legs
   if (!rlActive) rearLeftStop();
   if (!rrActive) rearRightStop();
   if (!flActive) frontLeftBrake();
   if (!frActive) frontRightBrake();
 
-  if (rlActive) rearLeftForward(REAR_SPEED_MAX);
-  if (rrActive) rearRightForward(REAR_SPEED_MAX);
-  if (flActive) frontLeftForward(FRONT_SPEED_MAX);
-  if (frActive) frontRightForward(FRONT_SPEED_MAX);
+  // Start only the active leg at fixed speed
+  if (rlActive) rearLeftForward(REAR_SPEED);
+  if (rrActive) rearRightForward(REAR_SPEED);
+  if (flActive) frontLeftForward(FRONT_SPEED);
+  if (frActive) frontRightForward(FRONT_SPEED);
 
   while (!(rlDone && rrDone && flDone && frDone)) {
     server.handleClient();
     yield();
 
-    if (millis() - startTime > TIMEOUT_MS) {
+    if (millis() - startTime > moveTimeout) {
       holdAllStopped();
 
-      Serial.println("TIMEOUT - one or more motors did not finish cycle");
+      Serial.println("TIMEOUT - active leg did not finish move");
+      Serial.print("Active leg = ");
+      Serial.println(legName(legIndex));
       Serial.print("RL counts = "); Serial.println(encCountA);
       Serial.print("RR counts = "); Serial.println(encCountB);
       Serial.print("FL counts = "); Serial.println(encCountFL);
@@ -489,77 +512,49 @@ bool walkOneDiagonalCycle(bool pairA, unsigned long &elapsedMs) {
       return false;
     }
 
+    // Keep inactive legs held
     if (!rlActive) rearLeftStop();
     if (!rrActive) rearRightStop();
     if (!flActive) frontLeftBrake();
     if (!frActive) frontRightBrake();
 
-    if (rlDone) rearLeftStop();
-    if (rrDone) rearRightStop();
-    if (flDone) frontLeftBrake();
-    if (frDone) frontRightBrake();
-
+    // Rear Left
     if (!rlDone) {
-      long remaining = REAR_LEFT_COUNTS_PER_CYCLE - encCountA;
-      if (remaining <= 0) {
+      if (encCountA >= rlTarget) {
         rearLeftStop();
         rlDone = true;
       } else {
-        uint8_t s = rampSpeedFromRemaining(
-          remaining,
-          REAR_RAMP_DOWN_THRESHOLD,
-          REAR_SPEED_MIN,
-          REAR_SPEED_MAX
-        );
-        ledcWrite(MOTOR_A_PWM, s);
+        ledcWrite(MOTOR_A_PWM, REAR_SPEED);
       }
     }
 
+    // Rear Right
     if (!rrDone) {
-      long remaining = REAR_RIGHT_COUNTS_PER_CYCLE - encCountB;
-      if (remaining <= 0) {
+      if (encCountB >= rrTarget) {
         rearRightStop();
         rrDone = true;
       } else {
-        uint8_t s = rampSpeedFromRemaining(
-          remaining,
-          REAR_RAMP_DOWN_THRESHOLD,
-          REAR_SPEED_MIN,
-          REAR_SPEED_MAX
-        );
-        ledcWrite(MOTOR_B_PWM, s);
+        ledcWrite(MOTOR_B_PWM, REAR_SPEED);
       }
     }
 
+    // Front Left
     if (!flDone) {
-      long remaining = FRONT_LEFT_COUNTS_PER_CYCLE - encCountFL;
-      if (remaining <= 0) {
+      if (encCountFL >= flTarget) {
         frontLeftBrake();
         flDone = true;
       } else {
-        uint8_t s = rampSpeedFromRemaining(
-          remaining,
-          FRONT_RAMP_DOWN_THRESHOLD,
-          FRONT_SPEED_MIN,
-          FRONT_SPEED_MAX
-        );
-        ledcWrite(FL_IN1, s);
+        ledcWrite(FL_IN1, FRONT_SPEED);
       }
     }
 
+    // Front Right
     if (!frDone) {
-      long remaining = FRONT_RIGHT_COUNTS_PER_CYCLE - encCountFR;
-      if (remaining <= 0) {
+      if (encCountFR >= frTarget) {
         frontRightBrake();
         frDone = true;
       } else {
-        uint8_t s = rampSpeedFromRemaining(
-          remaining,
-          FRONT_RAMP_DOWN_THRESHOLD,
-          FRONT_SPEED_MIN,
-          FRONT_SPEED_MAX
-        );
-        ledcWrite(FR_IN3, s);
+        ledcWrite(FR_IN3, FRONT_SPEED);
       }
     }
   }
@@ -575,13 +570,13 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  Serial.println("STAIR - diagonal pair walking (A A B B) + shell servo");
-  Serial.println("Cycle 1: RL + FR");
-  Serial.println("Cycle 2: RL + FR");
-  Serial.println("Cycle 3: RR + FL");
-  Serial.println("Cycle 4: RR + FL");
+  Serial.println("STAIR - one-leg-at-a-time walking + shell servo");
+  Serial.println("Move 1: RL (double cycle)");
+  Serial.println("Move 2: FL (double cycle)");
+  Serial.println("Move 3: RR (double cycle)");
+  Serial.println("Move 4: FR (double cycle)");
   Serial.println("START waits 2 seconds, opens shell, then walks.");
-  Serial.println("STOP finishes on an even cycle, then closes shell.");
+  Serial.println("STOP finishes on a full 4-leg boundary, then closes shell.");
 
   Serial.print("Rear left counts/cycle   = ");
   Serial.println(REAR_LEFT_COUNTS_PER_CYCLE);
@@ -594,6 +589,9 @@ void setup() {
 
   Serial.print("Front right counts/cycle = ");
   Serial.println(FRONT_RIGHT_COUNTS_PER_CYCLE);
+
+  Serial.print("Leg move multiplier      = ");
+  Serial.println(LEG_MOVE_MULTIPLIER);
 
   pinMode(MOTOR_A_INA, OUTPUT);
   pinMode(MOTOR_A_INB, OUTPUT);
@@ -645,11 +643,12 @@ void loop() {
     return;
   }
 
-  if (stopRequested && !cycleInProgress && (completedCycles % 2 == 0)) {
+  // Stop only after a full 4-leg sequence boundary
+  if (stopRequested && !cycleInProgress && (completedCycles % 4 == 0) && completedCycles > 0) {
     runEnabled = false;
     holdAllStopped();
     closeShellAfterStopping();
-    Serial.println("Stop request satisfied at even cycle boundary");
+    Serial.println("Stop request satisfied at full 4-leg boundary");
     delay(5);
     return;
   }
@@ -657,31 +656,34 @@ void loop() {
   currentCycleNumber = completedCycles + 1;
   cycleInProgress = true;
 
-  bool pairA = (((currentCycleNumber - 1) / 2) % 2 == 0);
+  uint8_t seqIndex = (currentCycleNumber - 1) % 4;
+  uint8_t legIndex = LEG_SEQUENCE[seqIndex];
 
   unsigned long tCycle = 0;
 
   Serial.println();
-  Serial.print("=== WALK CYCLE ");
+  Serial.print("=== LEG MOVE ");
   Serial.print(currentCycleNumber);
   Serial.print(" START: ");
-  Serial.println(pairA ? "RL + FR" : "RR + FL");
+  Serial.println(legName(legIndex));
 
-  bool ok = walkOneDiagonalCycle(pairA, tCycle);
+  bool ok = walkOneLegMove(legIndex, tCycle);
   cycleInProgress = false;
 
   if (!ok) {
     runEnabled = false;
     holdAllStopped();
-    Serial.println("Cycle failed. Holding brake.");
+    Serial.println("Leg move failed. Holding brake.");
     return;
   }
 
   completedCycles = currentCycleNumber;
 
-  Serial.print("Cycle ");
+  Serial.print("Leg move ");
   Serial.print(currentCycleNumber);
-  Serial.println(" complete.");
+  Serial.print(" complete. Active leg = ");
+  Serial.println(legName(legIndex));
+
   Serial.print("Time = ");
   Serial.print(tCycle);
   Serial.println(" ms");
@@ -691,10 +693,10 @@ void loop() {
   Serial.print("FL counts = "); Serial.println(encCountFL);
   Serial.print("FR counts = "); Serial.println(encCountFR);
 
-  if (stopRequested && (completedCycles % 2 == 0)) {
+  if (stopRequested && (completedCycles % 4 == 0)) {
     runEnabled = false;
     holdAllStopped();
     closeShellAfterStopping();
-    Serial.println("Graceful STOP complete at even cycle boundary");
+    Serial.println("Graceful STOP complete at full 4-leg boundary");
   }
 }
