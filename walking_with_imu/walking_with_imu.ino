@@ -1,28 +1,32 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESP32Servo.h>
+#include <Wire.h>
+#include <MPU6050_tockn.h>
+#include <math.h>
 
 // ============================================================
 // STAIR Robot — One-Leg-at-a-Time Walking Test
-// MERGED WITH SHELL-OPEN / SHELL-CLOSE SERVO
+// MERGED WITH SHELL + IMU FLIP/RECOVERY LOGIC
 //
 // Web UI:
 // - ESP32 creates Wi-Fi hotspot
 // - webpage has START and STOP
-// - START waits 2s, opens shell with servo, then begins walking
+// - START waits 2s, opens shell, then begins walking
 // - STOP is graceful and only stops at a full 4-leg boundary
-// - after stopping, servo reverses back to original position
+// - IMU pitch > threshold latches a flip request
+// - flip executes at next even move boundary
+// - after flip, robot holds active brake until pitch is stable
+//   within ±5 deg for 5 seconds
+// - then shell reopens, all 4 legs rotate one cycle each,
+//   and normal walking resumes
 //
-// Pattern:
+// Walking pattern:
 //   Move 1: RL  (double cycle)
 //   Move 2: FL  (double cycle)
 //   Move 3: RR  (double cycle)
 //   Move 4: FR  (double cycle)
 //   Then repeat...
-//
-// Note:
-// Each active leg move uses 2x the original counts-per-cycle so the
-// leg returns closer to the same mechanical phase before the next leg.
 // ============================================================
 
 // ---------------- Web UI ----------------
@@ -34,8 +38,8 @@ bool runEnabled      = false;
 bool stopRequested   = false;
 bool cycleInProgress = false;
 
-unsigned long completedCycles    = 0;   // now means completed LEG MOVES
-unsigned long currentCycleNumber = 0;   // now means current LEG MOVE number
+unsigned long completedCycles    = 0;   // completed LEG MOVES
+unsigned long currentCycleNumber = 0;   // current LEG MOVE number
 
 // ---------------- Shell servo ----------------
 Servo shellServo;
@@ -50,6 +54,26 @@ const unsigned long SHELL_OPEN_TIME_MS      = 1400;
 const unsigned long SHELL_CLOSE_TIME_MS     = 1215;
 
 bool shellIsOpen = false;
+
+// ---------------- IMU ----------------
+MPU6050 mpu6050(Wire);
+
+const int SDA_PIN = 36;
+const int SCL_PIN = 35;
+
+float angle_offset = 0.0f;
+float pitchDeg = 0.0f;
+
+const float PITCH_FLIP_THRESHOLD_DEG = 15.0f;
+const float PITCH_RECOVERY_BAND_DEG  = 5.0f;
+const unsigned long RECOVERY_STABLE_TIME_MS = 5000;
+
+bool flipRequested      = false;
+bool flipInProgress     = false;
+bool waitingForRecovery = false;
+bool rephaseInProgress  = false;
+
+unsigned long recoveryStableStartMs = 0;
 
 // ---------------- Rear motor pins ---------------
 #define MOTOR_A_INA   2
@@ -81,16 +105,23 @@ const long REAR_RIGHT_COUNTS_PER_CYCLE  = 700;
 const long FRONT_LEFT_COUNTS_PER_CYCLE  = 600;
 const long FRONT_RIGHT_COUNTS_PER_CYCLE = 605;
 
-const int LEG_MOVE_MULTIPLIER = 2;  // each active leg move = 2x old cycle
+const int LEG_MOVE_MULTIPLIER = 2;  // normal walking = 2x cycle per active leg
 
 // 0 = RL, 1 = FL, 2 = RR, 3 = FR
 const uint8_t LEG_SEQUENCE[4] = {0, 1, 2, 3};
 
 // ---------------- Speed tuning ----------------
-#define REAR_SPEED             200
-#define FRONT_SPEED            66
-#define TIMEOUT_MS             8000
+// uniform fixed speeds, no ramp-down
+#define REAR_SPEED   200
+#define FRONT_SPEED  66
+#define TIMEOUT_MS   8000
 
+// ---------------- Flip tuning ----------------
+const long REAR_FLIP_PULSE_COUNTS = 120;   // tune as needed
+const uint8_t REAR_FLIP_PULSE_PWM = 255;
+const unsigned long POST_FLIP_FRONT_DELAY_MS = 200;
+
+// ---------------- Encoder counts ----------------
 volatile long encCountA  = 0;   // rear left
 volatile long encCountB  = 0;   // rear right
 volatile long encCountFL = 0;   // front left
@@ -100,12 +131,26 @@ volatile long encCountFR = 0;   // front right
 // Forward declarations
 // ============================================================
 void holdAllStopped();
-bool walkOneLegMove(uint8_t legIndex, unsigned long &elapsedMs);
 void setupWebServer();
 String buildStatusJson();
+
 void openShellBeforeWalking();
+void reopenShellAfterRecovery();
 void closeShellAfterStopping();
+
+void updateIMU();
+void handlePostFlipRecovery();
+void performFlipSequence();
+
 const char* legName(uint8_t legIndex);
+
+bool walkOneLegMoveWithMultiplier(uint8_t legIndex, int moveMultiplier, unsigned long &elapsedMs);
+bool walkOneLegMove(uint8_t legIndex, unsigned long &elapsedMs);
+
+bool rotateRearBothOneCycle(unsigned long &elapsedMs);
+bool rotateFrontBothOneCycle(unsigned long &elapsedMs);
+bool rearFlipKickPulse(unsigned long &elapsedMs);
+bool rephaseAllLegsOneCycle();
 
 // ============================================================
 // Web page
@@ -127,7 +172,7 @@ const char WEB_PAGE[] PROGMEM = R"rawliteral(
       margin-bottom: 20px;
     }
     .card {
-      max-width: 440px;
+      max-width: 460px;
       margin: 0 auto;
       background: white;
       border-radius: 14px;
@@ -182,11 +227,13 @@ const char WEB_PAGE[] PROGMEM = R"rawliteral(
       <div><b>Current move:</b> <span id="currentCycle">-</span></div>
       <div><b>Completed moves:</b> <span id="completedCycles">-</span></div>
       <div><b>Stop requested:</b> <span id="stopRequested">-</span></div>
+      <div><b>Pitch:</b> <span id="pitchDeg">-</span> deg</div>
     </div>
 
     <div class="small">
       START waits 2 seconds, opens shell, then begins one-leg-at-a-time walking.
       STOP finishes on the next full 4-leg boundary, then closes shell.
+      IMU-triggered flip executes on the next even move boundary.
     </div>
   </div>
 
@@ -209,13 +256,14 @@ const char WEB_PAGE[] PROGMEM = R"rawliteral(
         document.getElementById('currentCycle').textContent = s.currentCycle;
         document.getElementById('completedCycles').textContent = s.completedCycles;
         document.getElementById('stopRequested').textContent = s.stopRequested ? 'YES' : 'NO';
+        document.getElementById('pitchDeg').textContent = s.pitchDeg;
       } catch (e) {
         document.getElementById('state').textContent = 'Disconnected';
       }
     }
 
     updateStatus();
-    setInterval(updateStatus, 500);
+    setInterval(updateStatus, 300);
   </script>
 </body>
 </html>
@@ -241,9 +289,8 @@ void IRAM_ATTR encoderFR_ISR() {
 }
 
 // ============================================================
-// Helpers
+// Helper labels
 // ============================================================
-
 const char* legName(uint8_t legIndex) {
   switch (legIndex) {
     case 0: return "RL";
@@ -254,6 +301,17 @@ const char* legName(uint8_t legIndex) {
   }
 }
 
+// ============================================================
+// IMU helpers
+// ============================================================
+void updateIMU() {
+  mpu6050.update();
+  pitchDeg = mpu6050.getAngleX() - angle_offset;
+}
+
+// ============================================================
+// Shell helpers
+// ============================================================
 void openShellBeforeWalking() {
   if (shellIsOpen) {
     Serial.println("Shell already open.");
@@ -271,6 +329,21 @@ void openShellBeforeWalking() {
   shellIsOpen = true;
 
   Serial.println("Shell open complete.");
+}
+
+void reopenShellAfterRecovery() {
+  if (shellIsOpen) {
+    Serial.println("Shell already open.");
+    return;
+  }
+
+  Serial.println("Reopening shell after recovery...");
+  shellServo.writeMicroseconds(SERVO_OPEN_US);
+  delay(SHELL_OPEN_TIME_MS);
+  shellServo.writeMicroseconds(SERVO_STOP_US);
+  shellIsOpen = true;
+
+  Serial.println("Shell reopen complete.");
 }
 
 void closeShellAfterStopping() {
@@ -301,6 +374,18 @@ void rearLeftForward(uint8_t speed) {
 void rearRightForward(uint8_t speed) {
   digitalWrite(MOTOR_B_INA, HIGH);
   digitalWrite(MOTOR_B_INB, LOW);
+  ledcWrite(MOTOR_B_PWM, speed);
+}
+
+void rearLeftReverse(uint8_t speed) {
+  digitalWrite(MOTOR_A_INA, LOW);
+  digitalWrite(MOTOR_A_INB, HIGH);
+  ledcWrite(MOTOR_A_PWM, speed);
+}
+
+void rearRightReverse(uint8_t speed) {
+  digitalWrite(MOTOR_B_INA, LOW);
+  digitalWrite(MOTOR_B_INB, HIGH);
   ledcWrite(MOTOR_B_PWM, speed);
 }
 
@@ -374,12 +459,20 @@ void holdAllStopped() {
 }
 
 // ============================================================
-// Web server
+// Web server / status
 // ============================================================
 String buildStatusJson() {
   String state;
 
-  if (!runEnabled && completedCycles == 0 && !stopRequested) {
+  if (flipInProgress) {
+    state = "FLIP";
+  } else if (rephaseInProgress) {
+    state = "REPHASE";
+  } else if (waitingForRecovery) {
+    state = "RECOVERY HOLD";
+  } else if (flipRequested) {
+    state = "FLIP REQUESTED";
+  } else if (!runEnabled && completedCycles == 0 && !stopRequested) {
     state = "IDLE";
   } else if (!runEnabled && completedCycles > 0) {
     state = "STOPPED";
@@ -395,7 +488,8 @@ String buildStatusJson() {
   json += "\"state\":\"" + state + "\",";
   json += "\"currentCycle\":" + String(shownCycle) + ",";
   json += "\"completedCycles\":" + String(completedCycles) + ",";
-  json += "\"stopRequested\":" + String(stopRequested ? "true" : "false");
+  json += "\"stopRequested\":" + String(stopRequested ? "true" : "false") + ",";
+  json += "\"pitchDeg\":" + String(pitchDeg, 2);
   json += "}";
 
   return json;
@@ -422,10 +516,15 @@ void setupWebServer() {
   });
 
   server.on("/start", HTTP_POST, []() {
-    if (!runEnabled && !cycleInProgress) {
+    if (!runEnabled && !cycleInProgress && !waitingForRecovery && !flipInProgress && !rephaseInProgress) {
       completedCycles = 0;
       currentCycleNumber = 0;
       stopRequested = false;
+      flipRequested = false;
+      flipInProgress = false;
+      waitingForRecovery = false;
+      rephaseInProgress = false;
+      recoveryStableStartMs = 0;
 
       holdAllStopped();
 
@@ -450,7 +549,7 @@ void setupWebServer() {
 }
 
 // ============================================================
-// One active-leg move
+// Generic one-leg move
 //
 // legIndex:
 //   0 -> RL
@@ -458,7 +557,7 @@ void setupWebServer() {
 //   2 -> RR
 //   3 -> FR
 // ============================================================
-bool walkOneLegMove(uint8_t legIndex, unsigned long &elapsedMs) {
+bool walkOneLegMoveWithMultiplier(uint8_t legIndex, int moveMultiplier, unsigned long &elapsedMs) {
   encCountA  = 0;
   encCountB  = 0;
   encCountFL = 0;
@@ -474,13 +573,12 @@ bool walkOneLegMove(uint8_t legIndex, unsigned long &elapsedMs) {
   bool rrDone = !rrActive;
   bool frDone = !frActive;
 
-  const long rlTarget = REAR_LEFT_COUNTS_PER_CYCLE   * LEG_MOVE_MULTIPLIER;
-  const long rrTarget = REAR_RIGHT_COUNTS_PER_CYCLE  * LEG_MOVE_MULTIPLIER;
-  const long flTarget = FRONT_LEFT_COUNTS_PER_CYCLE  * LEG_MOVE_MULTIPLIER;
-  const long frTarget = FRONT_RIGHT_COUNTS_PER_CYCLE * LEG_MOVE_MULTIPLIER;
+  const long rlTarget = REAR_LEFT_COUNTS_PER_CYCLE   * moveMultiplier;
+  const long rrTarget = REAR_RIGHT_COUNTS_PER_CYCLE  * moveMultiplier;
+  const long flTarget = FRONT_LEFT_COUNTS_PER_CYCLE  * moveMultiplier;
+  const long frTarget = FRONT_RIGHT_COUNTS_PER_CYCLE * moveMultiplier;
 
-  const unsigned long moveTimeout = TIMEOUT_MS * LEG_MOVE_MULTIPLIER;
-
+  const unsigned long moveTimeout = TIMEOUT_MS * moveMultiplier;
   unsigned long startTime = millis();
 
   // Hold inactive legs
@@ -498,6 +596,7 @@ bool walkOneLegMove(uint8_t legIndex, unsigned long &elapsedMs) {
   while (!(rlDone && rrDone && flDone && frDone)) {
     server.handleClient();
     yield();
+    updateIMU();
 
     if (millis() - startTime > moveTimeout) {
       holdAllStopped();
@@ -563,6 +662,309 @@ bool walkOneLegMove(uint8_t legIndex, unsigned long &elapsedMs) {
   return true;
 }
 
+bool walkOneLegMove(uint8_t legIndex, unsigned long &elapsedMs) {
+  return walkOneLegMoveWithMultiplier(legIndex, LEG_MOVE_MULTIPLIER, elapsedMs);
+}
+
+// ============================================================
+// Flip / recovery helpers
+// ============================================================
+bool rotateRearBothOneCycle(unsigned long &elapsedMs) {
+  encCountA = 0;
+  encCountB = 0;
+
+  bool rlDone = false;
+  bool rrDone = false;
+
+  unsigned long startTime = millis();
+
+  rearLeftForward(REAR_SPEED);
+  rearRightForward(REAR_SPEED);
+
+  while (!(rlDone && rrDone)) {
+    server.handleClient();
+    yield();
+    updateIMU();
+
+    if (millis() - startTime > TIMEOUT_MS) {
+      holdAllStopped();
+      return false;
+    }
+
+    if (!rlDone) {
+      if (encCountA >= REAR_LEFT_COUNTS_PER_CYCLE) {
+        rearLeftStop();
+        rlDone = true;
+      } else {
+        ledcWrite(MOTOR_A_PWM, REAR_SPEED);
+      }
+    }
+
+    if (!rrDone) {
+      if (encCountB >= REAR_RIGHT_COUNTS_PER_CYCLE) {
+        rearRightStop();
+        rrDone = true;
+      } else {
+        ledcWrite(MOTOR_B_PWM, REAR_SPEED);
+      }
+    }
+  }
+
+  holdAllStopped();
+  elapsedMs = millis() - startTime;
+  return true;
+}
+
+bool rotateFrontBothOneCycle(unsigned long &elapsedMs) {
+  encCountFL = 0;
+  encCountFR = 0;
+
+  bool flDone = false;
+  bool frDone = false;
+
+  unsigned long startTime = millis();
+
+  frontLeftForward(FRONT_SPEED);
+  frontRightForward(FRONT_SPEED);
+
+  while (!(flDone && frDone)) {
+    server.handleClient();
+    yield();
+    updateIMU();
+
+    if (millis() - startTime > TIMEOUT_MS) {
+      holdAllStopped();
+      return false;
+    }
+
+    if (!flDone) {
+      if (encCountFL >= FRONT_LEFT_COUNTS_PER_CYCLE) {
+        frontLeftBrake();
+        flDone = true;
+      } else {
+        ledcWrite(FL_IN1, FRONT_SPEED);
+      }
+    }
+
+    if (!frDone) {
+      if (encCountFR >= FRONT_RIGHT_COUNTS_PER_CYCLE) {
+        frontRightBrake();
+        frDone = true;
+      } else {
+        ledcWrite(FR_IN3, FRONT_SPEED);
+      }
+    }
+  }
+
+  holdAllStopped();
+  elapsedMs = millis() - startTime;
+  return true;
+}
+
+bool rearFlipKickPulse(unsigned long &elapsedMs) {
+  unsigned long startTime = millis();
+
+  // short forward pulse
+  encCountA = 0;
+  encCountB = 0;
+  bool rlFwdDone = false;
+  bool rrFwdDone = false;
+
+  rearLeftForward(REAR_FLIP_PULSE_PWM);
+  rearRightForward(REAR_FLIP_PULSE_PWM);
+
+  while (!(rlFwdDone && rrFwdDone)) {
+    server.handleClient();
+    yield();
+    updateIMU();
+
+    if (millis() - startTime > TIMEOUT_MS) {
+      holdAllStopped();
+      return false;
+    }
+
+    if (!rlFwdDone) {
+      if (encCountA >= REAR_FLIP_PULSE_COUNTS) {
+        rearLeftStop();
+        rlFwdDone = true;
+      } else {
+        ledcWrite(MOTOR_A_PWM, REAR_FLIP_PULSE_PWM);
+      }
+    }
+
+    if (!rrFwdDone) {
+      if (encCountB >= REAR_FLIP_PULSE_COUNTS) {
+        rearRightStop();
+        rrFwdDone = true;
+      } else {
+        ledcWrite(MOTOR_B_PWM, REAR_FLIP_PULSE_PWM);
+      }
+    }
+  }
+
+  delay(30);
+
+  // same-count backward pulse
+  encCountA = 0;
+  encCountB = 0;
+  bool rlRevDone = false;
+  bool rrRevDone = false;
+
+  rearLeftReverse(REAR_FLIP_PULSE_PWM);
+  rearRightReverse(REAR_FLIP_PULSE_PWM);
+
+  while (!(rlRevDone && rrRevDone)) {
+    server.handleClient();
+    yield();
+    updateIMU();
+
+    if (millis() - startTime > TIMEOUT_MS) {
+      holdAllStopped();
+      return false;
+    }
+
+    if (!rlRevDone) {
+      if (encCountA >= REAR_FLIP_PULSE_COUNTS) {
+        rearLeftStop();
+        rlRevDone = true;
+      } else {
+        ledcWrite(MOTOR_A_PWM, REAR_FLIP_PULSE_PWM);
+      }
+    }
+
+    if (!rrRevDone) {
+      if (encCountB >= REAR_FLIP_PULSE_COUNTS) {
+        rearRightStop();
+        rrRevDone = true;
+      } else {
+        ledcWrite(MOTOR_B_PWM, REAR_FLIP_PULSE_PWM);
+      }
+    }
+  }
+
+  holdAllStopped();
+  elapsedMs = millis() - startTime;
+  return true;
+}
+
+bool rephaseAllLegsOneCycle() {
+  rephaseInProgress = true;
+
+  unsigned long t = 0;
+  bool ok = true;
+
+  Serial.println("Rephase: RL one cycle");
+  ok = ok && walkOneLegMoveWithMultiplier(0, 1, t);
+
+  if (ok) {
+    Serial.println("Rephase: FL one cycle");
+    ok = ok && walkOneLegMoveWithMultiplier(1, 1, t);
+  }
+
+  if (ok) {
+    Serial.println("Rephase: RR one cycle");
+    ok = ok && walkOneLegMoveWithMultiplier(2, 1, t);
+  }
+
+  if (ok) {
+    Serial.println("Rephase: FR one cycle");
+    ok = ok && walkOneLegMoveWithMultiplier(3, 1, t);
+  }
+
+  holdAllStopped();
+  rephaseInProgress = false;
+  return ok;
+}
+
+void performFlipSequence() {
+  flipInProgress = true;
+  runEnabled = false;
+
+  Serial.println("=== FLIP SEQUENCE START ===");
+
+  holdAllStopped();
+  closeShellAfterStopping();
+
+  unsigned long tRearCycle = 0;
+  unsigned long tKick = 0;
+  unsigned long tFrontCycle = 0;
+
+  bool okRearCycle = rotateRearBothOneCycle(tRearCycle);
+  bool okKick = false;
+  bool okFront = false;
+
+  if (okRearCycle) {
+    okKick = rearFlipKickPulse(tKick);
+  }
+
+  delay(POST_FLIP_FRONT_DELAY_MS);
+
+  if (okRearCycle && okKick) {
+    okFront = rotateFrontBothOneCycle(tFrontCycle);
+  }
+
+  holdAllStopped();
+
+  Serial.print("Rear one-cycle: ");
+  Serial.println(okRearCycle ? "OK" : "FAIL");
+
+  Serial.print("Rear flip pulse: ");
+  Serial.println(okKick ? "OK" : "FAIL");
+
+  Serial.print("Front one-cycle: ");
+  Serial.println(okFront ? "OK" : "FAIL");
+
+  Serial.println("=== FLIP SEQUENCE END ===");
+
+  flipRequested = false;
+  flipInProgress = false;
+  waitingForRecovery = true;
+  recoveryStableStartMs = 0;
+
+  Serial.println("Holding active brake and waiting for recovery.");
+}
+
+void handlePostFlipRecovery() {
+  if (!waitingForRecovery) return;
+
+  holdAllStopped();
+
+  if (fabs(pitchDeg) <= PITCH_RECOVERY_BAND_DEG) {
+    if (recoveryStableStartMs == 0) {
+      recoveryStableStartMs = millis();
+      Serial.println("Recovery band entered. Timing stability...");
+    } else if (millis() - recoveryStableStartMs >= RECOVERY_STABLE_TIME_MS) {
+      Serial.println("Recovery condition met: pitch stable near 0 deg for 5 seconds.");
+
+      reopenShellAfterRecovery();
+
+      bool ok = rephaseAllLegsOneCycle();
+
+      if (ok) {
+        completedCycles = 0;
+        currentCycleNumber = 0;
+        waitingForRecovery = false;
+        recoveryStableStartMs = 0;
+        runEnabled = true;
+        stopRequested = false;
+        flipRequested = false;
+
+        Serial.println("Recovery rephase complete. Resuming normal walking.");
+      } else {
+        waitingForRecovery = false;
+        recoveryStableStartMs = 0;
+        runEnabled = false;
+        Serial.println("Recovery rephase failed. Holding active brake.");
+      }
+    }
+  } else {
+    if (recoveryStableStartMs != 0) {
+      Serial.println("Recovery band lost. Resetting stability timer.");
+    }
+    recoveryStableStartMs = 0;
+  }
+}
+
 // ============================================================
 // Setup
 // ============================================================
@@ -570,13 +972,14 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  Serial.println("STAIR - one-leg-at-a-time walking + shell servo");
+  Serial.println("STAIR - one-leg-at-a-time walking + shell servo + IMU flip");
   Serial.println("Move 1: RL (double cycle)");
   Serial.println("Move 2: FL (double cycle)");
   Serial.println("Move 3: RR (double cycle)");
   Serial.println("Move 4: FR (double cycle)");
   Serial.println("START waits 2 seconds, opens shell, then walks.");
   Serial.println("STOP finishes on a full 4-leg boundary, then closes shell.");
+  Serial.println("IMU pitch > 15 deg triggers flip on next even move boundary.");
 
   Serial.print("Rear left counts/cycle   = ");
   Serial.println(REAR_LEFT_COUNTS_PER_CYCLE);
@@ -593,6 +996,7 @@ void setup() {
   Serial.print("Leg move multiplier      = ");
   Serial.println(LEG_MOVE_MULTIPLIER);
 
+  // Motors
   pinMode(MOTOR_A_INA, OUTPUT);
   pinMode(MOTOR_A_INB, OUTPUT);
   pinMode(MOTOR_B_INA, OUTPUT);
@@ -608,6 +1012,7 @@ void setup() {
   ledcAttach(FL_IN1, 20000, 8);
   ledcAttach(FR_IN3, 20000, 8);
 
+  // Encoders
   pinMode(ENC_A_PIN, INPUT);
   pinMode(ENC_B_PIN, INPUT);
   pinMode(ENC_FL_PIN, INPUT);
@@ -618,9 +1023,30 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENC_FL_PIN), encoderFL_ISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_FR_PIN), encoderFR_ISR, CHANGE);
 
+  // Servo
   shellServo.setPeriodHertz(50);
   shellServo.attach(SERVO_PIN, 500, 2500);
   shellServo.writeMicroseconds(SERVO_STOP_US);
+
+  // IMU
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+
+  Serial.println("I2C + MPU6050 init");
+  mpu6050.begin();
+
+  Serial.println("Calibrating gyro... keep sensor still");
+  mpu6050.calcGyroOffsets(true);
+
+  Serial.println("Settling IMU...");
+  for (int i = 0; i < 100; i++) {
+    mpu6050.update();
+    delay(10);
+  }
+
+  angle_offset = mpu6050.getAngleX();
+  Serial.print("Pitch zero offset = ");
+  Serial.println(angle_offset, 4);
 
   holdAllStopped();
   setupWebServer();
@@ -636,19 +1062,46 @@ void setup() {
 // ============================================================
 void loop() {
   server.handleClient();
+  updateIMU();
 
+  // Post-flip recovery hold / resume logic
+  if (waitingForRecovery) {
+    handlePostFlipRecovery();
+    delay(5);
+    return;
+  }
+
+  // Idle hold
   if (!runEnabled) {
     holdAllStopped();
     delay(5);
     return;
   }
 
-  // Stop only after a full 4-leg sequence boundary
+  // While walking, latch flip request if pitch exceeds threshold
+  if (!flipRequested && !flipInProgress && !rephaseInProgress) {
+    if (pitchDeg > PITCH_FLIP_THRESHOLD_DEG) {
+      flipRequested = true;
+      Serial.print("IMU flip request latched. Pitch = ");
+      Serial.println(pitchDeg, 2);
+    }
+  }
+
+  // Manual STOP button behavior stays the same:
+  // stop only after a full 4-leg sequence boundary
   if (stopRequested && !cycleInProgress && (completedCycles % 4 == 0) && completedCycles > 0) {
     runEnabled = false;
     holdAllStopped();
     closeShellAfterStopping();
     Serial.println("Stop request satisfied at full 4-leg boundary");
+    delay(5);
+    return;
+  }
+
+  // IMU flip executes on next even move boundary
+  if (flipRequested && !stopRequested && !cycleInProgress && (completedCycles % 2 == 0) && completedCycles > 0) {
+    holdAllStopped();
+    performFlipSequence();
     delay(5);
     return;
   }
@@ -693,10 +1146,19 @@ void loop() {
   Serial.print("FL counts = "); Serial.println(encCountFL);
   Serial.print("FR counts = "); Serial.println(encCountFR);
 
+  // Manual STOP button behavior stays the same
   if (stopRequested && (completedCycles % 4 == 0)) {
     runEnabled = false;
     holdAllStopped();
     closeShellAfterStopping();
     Serial.println("Graceful STOP complete at full 4-leg boundary");
+    return;
+  }
+
+  // IMU flip executes on next even move boundary
+  if (flipRequested && !stopRequested && (completedCycles % 2 == 0)) {
+    holdAllStopped();
+    performFlipSequence();
+    return;
   }
 }
