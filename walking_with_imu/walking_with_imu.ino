@@ -49,11 +49,15 @@ const int SERVO_STOP_US  = 1500;
 const int SERVO_OPEN_US  = 600;
 const int SERVO_CLOSE_US = 2400;
 
-const unsigned long SHELL_PRESTART_DELAY_MS = 2000;
-const unsigned long SHELL_OPEN_TIME_MS      = 1400;
-const unsigned long SHELL_CLOSE_TIME_MS     = 1215;
+const unsigned long SHELL_PRESTART_DELAY_MS    = 2000;
+const unsigned long SHELL_OPEN_TIME_MS         = 1500;
+const unsigned long SHELL_CLOSE_TIME_MS_NORMAL = 1340;
+const unsigned long SHELL_CLOSE_TIME_MS_LATE   = 1050;
+const unsigned long LATE_STOP_WINDOW_MS        = 5000;
 
 bool shellIsOpen = false;
+unsigned long startButtonPressedMs = 0;
+bool useLateShellClose = false;
 
 // ---------------- IMU ----------------
 MPU6050 mpu6050(Wire);
@@ -113,7 +117,7 @@ const uint8_t LEG_SEQUENCE[4] = {0, 1, 2, 3};
 // ---------------- Speed tuning ----------------
 // uniform fixed speeds, no ramp-down
 #define REAR_SPEED   200
-#define FRONT_SPEED  66
+#define FRONT_SPEED  76
 #define TIMEOUT_MS   8000
 
 // ---------------- Flip tuning ----------------
@@ -352,12 +356,19 @@ void closeShellAfterStopping() {
     return;
   }
 
-  Serial.println("Closing shell...");
+  unsigned long closeTime = useLateShellClose ? SHELL_CLOSE_TIME_MS_LATE
+                                              : SHELL_CLOSE_TIME_MS_NORMAL;
+
+  Serial.print("Closing shell... using ");
+  Serial.print(closeTime);
+  Serial.println(" ms");
+
   shellServo.writeMicroseconds(SERVO_CLOSE_US);
-  delay(SHELL_CLOSE_TIME_MS);
+  delay(closeTime);
 
   shellServo.writeMicroseconds(SERVO_STOP_US);
   shellIsOpen = false;
+  useLateShellClose = false;
 
   Serial.println("Shell close complete.");
 }
@@ -525,6 +536,8 @@ void setupWebServer() {
       waitingForRecovery = false;
       rephaseInProgress = false;
       recoveryStableStartMs = 0;
+      useLateShellClose = false;
+      startButtonPressedMs = millis();
 
       holdAllStopped();
 
@@ -539,7 +552,21 @@ void setupWebServer() {
 
   server.on("/stop", HTTP_POST, []() {
     stopRequested = true;
+
+    unsigned long dt = millis() - startButtonPressedMs;
+    useLateShellClose = (dt > LATE_STOP_WINDOW_MS);
+
     Serial.println("Web STOP requested");
+    Serial.print("Time since START press = ");
+    Serial.print(dt);
+    Serial.println(" ms");
+
+    if (useLateShellClose) {
+      Serial.println("STOP was pressed AFTER 5 seconds: shell close will use 1050 ms.");
+    } else {
+      Serial.println("STOP was pressed within 5 seconds: shell close will use 1340 ms.");
+    }
+
     Serial.println("Robot will stop at the next full 4-leg boundary, then close shell");
     server.send(200, "text/plain", "STOP_REQUESTED");
   });

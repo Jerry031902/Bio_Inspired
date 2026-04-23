@@ -31,7 +31,7 @@ void setup() {
   myServo.writeMicroseconds(SERVO_STOP_US);
   delay(5000);
   myServo.writeMicroseconds(SERVO_REV_US);
-  delay(1382);
+  delay(1340);
   myServo.writeMicroseconds(SERVO_STOP_US);
   Serial.println("=== Servo test end ===");
 }
