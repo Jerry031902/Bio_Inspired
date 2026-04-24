@@ -70,7 +70,7 @@ float pitchDeg = 0.0f;
 
 unsigned long flipPositiveStartMs = 0;
 const unsigned long FLIP_TRIGGER_HOLD_MS = 150;
-const float PITCH_FLIP_THRESHOLD_DEG = 5.0f;
+const float PITCH_FLIP_THRESHOLD_DEG = 15.0f;
 const float PITCH_RECOVERY_BAND_DEG  = 5.0f;
 const unsigned long RECOVERY_STABLE_TIME_MS = 5000;
 
@@ -106,32 +106,38 @@ unsigned long recoveryStableStartMs = 0;
 #define ENC_FR_PIN    13
 
 // ---------------- Counts ----------------
-const long REAR_LEFT_COUNTS_PER_CYCLE   = 700;
-const long REAR_RIGHT_COUNTS_PER_CYCLE  = 700;
-const long FRONT_LEFT_COUNTS_PER_CYCLE  = 600;
-const long FRONT_RIGHT_COUNTS_PER_CYCLE = 605;
+const long REAR_LEFT_COUNTS_PER_CYCLE   = 688;
+const long REAR_RIGHT_COUNTS_PER_CYCLE  = 719;
+const long FRONT_LEFT_COUNTS_PER_CYCLE  = 614;
+const long FRONT_RIGHT_COUNTS_PER_CYCLE = 629;
+//const long FRONT_LEFT_COUNTS_PER_CYCLE  = 615;
+//const long FRONT_RIGHT_COUNTS_PER_CYCLE = 630;
 
 const int LEG_MOVE_MULTIPLIER = 2;  // normal walking = 2x cycle per active leg
 
 // 0 = RL, 1 = FL, 2 = RR, 3 = FR
-const uint8_t LEG_SEQUENCE[4] = {0, 3, 1, 2};
+const uint8_t LEG_SEQUENCE[4] = {0, 2, 1, 3};
 
 // ---------------- Speed tuning ----------------
-// uniform fixed speeds, no ramp-down
-#define REAR_SPEED   200
-#define FRONT_SPEED  80
+// counts unchanged; only split speed by side
+const uint8_t REAR_LEFT_SPEED   = 200;
+const uint8_t REAR_RIGHT_SPEED  = 210;
+
+const uint8_t FRONT_LEFT_SPEED  = 70;
+const uint8_t FRONT_RIGHT_SPEED = 70;
+
 #define TIMEOUT_MS   8000
 
 // ---------------- Flip tuning ----------------
-// New rear kick pulse:
-//   1) short forward A
-//   2) larger backward B fast
-//   3) forward (B - A) to return to original position
-const long REAR_FLIP_FORWARD_COUNTS   = 600;   // A
-const long REAR_FLIP_BACKWARD_COUNTS  = 1000;  // B, must be > A
-const uint8_t REAR_FLIP_FORWARD_PWM   = REAR_SPEED;
-const uint8_t REAR_FLIP_BACKWARD_PWM  = 255;
-const uint8_t REAR_FLIP_RECOVER_PWM   = REAR_SPEED;
+// Counts unchanged
+const long REAR_FLIP_FORWARD_COUNTS   = 650;   // A
+const long REAR_FLIP_BACKWARD_COUNTS  = 1050;  // B, must be > A
+
+const uint8_t REAR_FLIP_FORWARD_PWM_LEFT   = REAR_LEFT_SPEED;
+const uint8_t REAR_FLIP_FORWARD_PWM_RIGHT  = REAR_RIGHT_SPEED;
+const uint8_t REAR_FLIP_BACKWARD_PWM       = 255;
+const uint8_t REAR_FLIP_RECOVER_PWM_LEFT   = REAR_LEFT_SPEED;
+const uint8_t REAR_FLIP_RECOVER_PWM_RIGHT  = REAR_RIGHT_SPEED;
 
 const unsigned long POST_FLIP_FRONT_DELAY_MS = 400;
 
@@ -625,10 +631,10 @@ bool walkOneLegMoveWithMultiplier(uint8_t legIndex, int moveMultiplier, unsigned
   if (!frActive) frontRightBrake();
 
   // Start only the active leg at fixed speed
-  if (rlActive) rearLeftForward(REAR_SPEED);
-  if (rrActive) rearRightForward(REAR_SPEED);
-  if (flActive) frontLeftForward(FRONT_SPEED);
-  if (frActive) frontRightForward(FRONT_SPEED);
+  if (rlActive) rearLeftForward(REAR_LEFT_SPEED);
+  if (rrActive) rearRightForward(REAR_RIGHT_SPEED);
+  if (flActive) frontLeftForward(FRONT_LEFT_SPEED);
+  if (frActive) frontRightForward(FRONT_RIGHT_SPEED);
 
   while (!(rlDone && rrDone && flDone && frDone)) {
     server.handleClient();
@@ -660,7 +666,7 @@ bool walkOneLegMoveWithMultiplier(uint8_t legIndex, int moveMultiplier, unsigned
         rearLeftStop();
         rlDone = true;
       } else {
-        ledcWrite(MOTOR_A_PWM, REAR_SPEED);
+        ledcWrite(MOTOR_A_PWM, REAR_LEFT_SPEED);
       }
     }
 
@@ -670,7 +676,7 @@ bool walkOneLegMoveWithMultiplier(uint8_t legIndex, int moveMultiplier, unsigned
         rearRightStop();
         rrDone = true;
       } else {
-        ledcWrite(MOTOR_B_PWM, REAR_SPEED);
+        ledcWrite(MOTOR_B_PWM, REAR_RIGHT_SPEED);
       }
     }
 
@@ -680,7 +686,7 @@ bool walkOneLegMoveWithMultiplier(uint8_t legIndex, int moveMultiplier, unsigned
         frontLeftBrake();
         flDone = true;
       } else {
-        ledcWrite(FL_IN1, FRONT_SPEED);
+        ledcWrite(FL_IN1, FRONT_LEFT_SPEED);
       }
     }
 
@@ -690,7 +696,7 @@ bool walkOneLegMoveWithMultiplier(uint8_t legIndex, int moveMultiplier, unsigned
         frontRightBrake();
         frDone = true;
       } else {
-        ledcWrite(FR_IN3, FRONT_SPEED);
+        ledcWrite(FR_IN3, FRONT_RIGHT_SPEED);
       }
     }
   }
@@ -715,8 +721,8 @@ bool rotateRearBothOneCycle(unsigned long &elapsedMs) {
 
   unsigned long startTime = millis();
 
-  rearLeftForward(REAR_SPEED);
-  rearRightForward(REAR_SPEED);
+  rearLeftForward(REAR_LEFT_SPEED);
+  rearRightForward(REAR_RIGHT_SPEED);
 
   while (!(rlDone && rrDone)) {
     server.handleClient();
@@ -733,7 +739,7 @@ bool rotateRearBothOneCycle(unsigned long &elapsedMs) {
         rearLeftStop();
         rlDone = true;
       } else {
-        ledcWrite(MOTOR_A_PWM, REAR_SPEED);
+        ledcWrite(MOTOR_A_PWM, REAR_LEFT_SPEED);
       }
     }
 
@@ -742,7 +748,7 @@ bool rotateRearBothOneCycle(unsigned long &elapsedMs) {
         rearRightStop();
         rrDone = true;
       } else {
-        ledcWrite(MOTOR_B_PWM, REAR_SPEED);
+        ledcWrite(MOTOR_B_PWM, REAR_RIGHT_SPEED);
       }
     }
   }
@@ -761,8 +767,8 @@ bool rotateFrontBothOneCycle(unsigned long &elapsedMs) {
 
   unsigned long startTime = millis();
 
-  frontLeftForward(FRONT_SPEED);
-  frontRightForward(FRONT_SPEED);
+  frontLeftForward(FRONT_LEFT_SPEED);
+  frontRightForward(FRONT_RIGHT_SPEED);
 
   while (!(flDone && frDone)) {
     server.handleClient();
@@ -779,7 +785,7 @@ bool rotateFrontBothOneCycle(unsigned long &elapsedMs) {
         frontLeftBrake();
         flDone = true;
       } else {
-        ledcWrite(FL_IN1, FRONT_SPEED);
+        ledcWrite(FL_IN1, FRONT_LEFT_SPEED);
       }
     }
 
@@ -788,7 +794,7 @@ bool rotateFrontBothOneCycle(unsigned long &elapsedMs) {
         frontRightBrake();
         frDone = true;
       } else {
-        ledcWrite(FR_IN3, FRONT_SPEED);
+        ledcWrite(FR_IN3, FRONT_RIGHT_SPEED);
       }
     }
   }
@@ -814,8 +820,8 @@ bool rearFlipKickPulse(unsigned long &elapsedMs) {
   bool rrFwdDone = false;
 
   unsigned long phaseStart = millis();
-  rearLeftForward(REAR_FLIP_FORWARD_PWM);
-  rearRightForward(REAR_FLIP_FORWARD_PWM);
+  rearLeftForward(REAR_FLIP_FORWARD_PWM_LEFT);
+  rearRightForward(REAR_FLIP_FORWARD_PWM_RIGHT);
 
   while (!(rlFwdDone && rrFwdDone)) {
     server.handleClient();
@@ -832,7 +838,7 @@ bool rearFlipKickPulse(unsigned long &elapsedMs) {
         rearLeftStop();
         rlFwdDone = true;
       } else {
-        ledcWrite(MOTOR_A_PWM, REAR_FLIP_FORWARD_PWM);
+        ledcWrite(MOTOR_A_PWM, REAR_FLIP_FORWARD_PWM_LEFT);
       }
     }
 
@@ -841,7 +847,7 @@ bool rearFlipKickPulse(unsigned long &elapsedMs) {
         rearRightStop();
         rrFwdDone = true;
       } else {
-        ledcWrite(MOTOR_B_PWM, REAR_FLIP_FORWARD_PWM);
+        ledcWrite(MOTOR_B_PWM, REAR_FLIP_FORWARD_PWM_RIGHT);
       }
     }
   }
@@ -896,8 +902,8 @@ bool rearFlipKickPulse(unsigned long &elapsedMs) {
   bool rrRecoverDone = false;
 
   phaseStart = millis();
-  rearLeftForward(REAR_FLIP_RECOVER_PWM);
-  rearRightForward(REAR_FLIP_RECOVER_PWM);
+  rearLeftForward(REAR_FLIP_RECOVER_PWM_LEFT);
+  rearRightForward(REAR_FLIP_RECOVER_PWM_RIGHT);
 
   while (!(rlRecoverDone && rrRecoverDone)) {
     server.handleClient();
@@ -914,7 +920,7 @@ bool rearFlipKickPulse(unsigned long &elapsedMs) {
         rearLeftStop();
         rlRecoverDone = true;
       } else {
-        ledcWrite(MOTOR_A_PWM, REAR_FLIP_RECOVER_PWM);
+        ledcWrite(MOTOR_A_PWM, REAR_FLIP_RECOVER_PWM_LEFT);
       }
     }
 
@@ -923,7 +929,7 @@ bool rearFlipKickPulse(unsigned long &elapsedMs) {
         rearRightStop();
         rrRecoverDone = true;
       } else {
-        ledcWrite(MOTOR_B_PWM, REAR_FLIP_RECOVER_PWM);
+        ledcWrite(MOTOR_B_PWM, REAR_FLIP_RECOVER_PWM_RIGHT);
       }
     }
   }
@@ -1082,6 +1088,15 @@ void setup() {
   Serial.print("Leg move multiplier      = ");
   Serial.println(LEG_MOVE_MULTIPLIER);
 
+  Serial.print("Rear left speed          = ");
+  Serial.println(REAR_LEFT_SPEED);
+  Serial.print("Rear right speed         = ");
+  Serial.println(REAR_RIGHT_SPEED);
+  Serial.print("Front left speed         = ");
+  Serial.println(FRONT_LEFT_SPEED);
+  Serial.print("Front right speed        = ");
+  Serial.println(FRONT_RIGHT_SPEED);
+
   // Motors
   pinMode(MOTOR_A_INA, OUTPUT);
   pinMode(MOTOR_A_INB, OUTPUT);
@@ -1165,22 +1180,22 @@ void loop() {
   }
 
   // While walking, latch flip request only if POSITIVE pitch stays
-// above threshold for a short time.
-// Negative pitch will never trigger.
-if (!flipRequested && !flipInProgress && !rephaseInProgress) {
-  if (pitchDeg >= PITCH_FLIP_THRESHOLD_DEG) {
-    if (flipPositiveStartMs == 0) {
-      flipPositiveStartMs = millis();
-    } else if (millis() - flipPositiveStartMs >= FLIP_TRIGGER_HOLD_MS) {
-      flipRequested = true;
+  // above threshold for a short time.
+  // Negative pitch will never trigger.
+  if (!flipRequested && !flipInProgress && !rephaseInProgress) {
+    if (pitchDeg >= PITCH_FLIP_THRESHOLD_DEG) {
+      if (flipPositiveStartMs == 0) {
+        flipPositiveStartMs = millis();
+      } else if (millis() - flipPositiveStartMs >= FLIP_TRIGGER_HOLD_MS) {
+        flipRequested = true;
+        flipPositiveStartMs = 0;
+        Serial.print("IMU flip request latched. Pitch = ");
+        Serial.println(pitchDeg, 2);
+      }
+    } else {
       flipPositiveStartMs = 0;
-      Serial.print("IMU flip request latched. Pitch = ");
-      Serial.println(pitchDeg, 2);
     }
-  } else {
-    flipPositiveStartMs = 0;
   }
-}
 
   // Manual STOP button behavior stays the same:
   // stop only after a full 4-leg sequence boundary

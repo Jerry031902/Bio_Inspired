@@ -66,8 +66,8 @@ Servo shellServo;
 
 const int SERVO_PIN      = 8;
 const int SERVO_STOP_US  = 1500;
-const int SERVO_OPEN_US  = 600;
-const int SERVO_CLOSE_US = 2400;
+const int SERVO_OPEN_US  = 2400;
+const int SERVO_CLOSE_US = 600;
 
 const unsigned long SHELL_PRESTART_DELAY_MS = 2000;
 const unsigned long SHELL_OPEN_TIME_MS      = 1500;
