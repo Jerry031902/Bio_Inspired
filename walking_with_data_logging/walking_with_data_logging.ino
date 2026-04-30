@@ -83,8 +83,8 @@ float pitchDeg = 0.0f;
 
 unsigned long flipPositiveStartMs = 0;
 const unsigned long FLIP_TRIGGER_HOLD_MS = 150;
-const float PITCH_FLIP_THRESHOLD_DEG = 12.0f;
-const float PITCH_RECOVERY_BAND_DEG  = 5.0f;
+const float PITCH_FLIP_THRESHOLD_DEG = 20.0f;
+const float PITCH_RECOVERY_BAND_DEG  = 14.0f;
 const unsigned long RECOVERY_STABLE_TIME_MS = 5000;
 
 bool flipRequested      = false;
